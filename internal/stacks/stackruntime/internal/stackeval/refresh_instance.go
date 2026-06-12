@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package stackeval
@@ -74,7 +74,7 @@ func (r *RefreshInstance) Plan(ctx context.Context) (*plans.Plan, tfdiags.Diagno
 		// compatible with the destroy operation.
 		opts.PreDestroyRefresh = true
 
-		plan, moreDiags := PlanComponentInstance(ctx, r.component.main, r.component.PlanPrevState(), opts, r.component)
+		plan, moreDiags := PlanComponentInstance(ctx, r.component.main, r.component.PlanPrevState(), opts, nil, r.component)
 		return plan, diags.Append(moreDiags)
 	})
 }

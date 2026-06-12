@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -14,6 +14,8 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/backend"
+	backendInit "github.com/hashicorp/terraform/internal/backend/init"
 	"github.com/hashicorp/terraform/internal/configs/configload"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/initwd"
@@ -27,7 +29,7 @@ import (
 func TestGraph_planPhase(t *testing.T) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath("graph"), td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	ui := new(cli.MockUi)
 	streams, closeStreams := terminal.StreamsForTesting(t)
@@ -53,7 +55,7 @@ func TestGraph_planPhase(t *testing.T) {
 func TestGraph_cyclic(t *testing.T) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath("graph-cyclic"), td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	tests := []struct {
 		name     string
@@ -189,7 +191,7 @@ func TestGraph_multipleArgs(t *testing.T) {
 func TestGraph_noConfig(t *testing.T) {
 	td := t.TempDir()
 	os.MkdirAll(td, 0755)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	streams, closeStreams := terminal.StreamsForTesting(t)
 	defer closeStreams(t)
@@ -212,7 +214,7 @@ func TestGraph_noConfig(t *testing.T) {
 
 func TestGraph_resourcesOnly(t *testing.T) {
 	wd := tempWorkingDirFixture(t, "graph-interesting")
-	defer testChdir(t, wd.RootModuleDir())()
+	t.Chdir(wd.RootModuleDir())
 
 	// The graph-interesting fixture has a child module, so we'll need to
 	// run the module installer just to get the working directory set up
@@ -224,8 +226,8 @@ func TestGraph_resourcesOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inst := initwd.NewModuleInstaller(".terraform/modules", loader, registry.NewClient(nil, nil))
-	_, instDiags := inst.InstallModules(context.Background(), ".", "tests", true, false, initwd.ModuleInstallHooksImpl{})
+	inst := initwd.NewModuleInstaller(".terraform/modules", loader, registry.NewClient(nil, nil), nil)
+	_, instDiags := inst.InstallModules(context.Background(), ".", "tests", true, false)
 	if instDiags.HasErrors() {
 		t.Fatal(instDiags.Err())
 	}
@@ -292,7 +294,8 @@ digraph G {
 }
 
 func TestGraph_applyPhaseSavedPlan(t *testing.T) {
-	testCwd(t)
+	tmp := t.TempDir()
+	t.Chdir(tmp)
 
 	emptyObj, err := plans.NewDynamicValue(cty.EmptyObjectVal, cty.EmptyObject)
 	if err != nil {
@@ -324,12 +327,13 @@ func TestGraph_applyPhaseSavedPlan(t *testing.T) {
 		},
 	})
 
-	plan.Backend = plans.Backend{
+	plan.Backend = &plans.Backend{
 		// Doesn't actually matter since we aren't going to activate the backend
 		// for this command anyway, but we need something here for the plan
 		// file writer to succeed.
-		Type:   "placeholder",
-		Config: emptyObj,
+		Type:      "placeholder",
+		Config:    emptyObj,
+		Workspace: "default",
 	}
 	_, configSnap := testModuleWithSnapshot(t, "graph")
 
@@ -356,4 +360,104 @@ func TestGraph_applyPhaseSavedPlan(t *testing.T) {
 	if !strings.Contains(output.Stdout(), `provider[\"registry.terraform.io/hashicorp/test\"]`) {
 		t.Fatalf("doesn't look like digraph:\n%s\n\nstderr:\n%s", output.Stdout(), output.Stderr())
 	}
+}
+
+func TestGraph_constVariable(t *testing.T) {
+	t.Run("missing value", func(t *testing.T) {
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var")
+		t.Chdir(wd.RootModuleDir())
+
+		ui := cli.NewMockUi()
+		streams, closeStreams := terminal.StreamsForTesting(t)
+		c := &GraphCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				Ui:               ui,
+				Streams:          streams,
+				WorkingDir:       wd,
+			},
+		}
+
+		args := []string{}
+		if code := c.Run(args); code != 1 {
+			output := closeStreams(t)
+			t.Fatalf("expected exit status 1\nstdout:\n%s\n\nstderr:\n%s", output.Stdout(), output.Stderr())
+		}
+
+		if !strings.Contains(ui.ErrorWriter.String(), "No value for required variable") {
+			t.Fatalf("expected missing variable error, got:\n%s", ui.ErrorWriter.String())
+		}
+		closeStreams(t)
+	})
+
+	t.Run("value via cli", func(t *testing.T) {
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var")
+		t.Chdir(wd.RootModuleDir())
+
+		ui := cli.NewMockUi()
+		streams, closeStreams := terminal.StreamsForTesting(t)
+		c := &GraphCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				Ui:               ui,
+				Streams:          streams,
+				WorkingDir:       wd,
+			},
+		}
+
+		args := []string{"-var", "module_name=child"}
+		if code := c.Run(args); code != 0 {
+			output := closeStreams(t)
+			t.Fatalf("bad:\nstdout:\n%s\n\nstderr:\n%s", output.Stdout(), output.Stderr())
+		}
+
+		output := closeStreams(t)
+		wantOutput := []string{
+			`"module.child.test_instance.test" [label="test_instance.test"]`,
+		}
+		for _, want := range wantOutput {
+			if !strings.Contains(output.Stdout(), want) {
+				t.Fatalf("output missing %s:\n%s", want, output.Stdout())
+			}
+		}
+	})
+
+	t.Run("value via backend", func(t *testing.T) {
+		mockBackend := TestNewVariableBackend(map[string]string{
+			"module_name": "child",
+		})
+		backendInit.Set("local-vars", func() backend.Backend { return mockBackend })
+		defer backendInit.Set("local-vars", nil)
+
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var-backend")
+		t.Chdir(wd.RootModuleDir())
+
+		ui := cli.NewMockUi()
+		streams, closeStreams := terminal.StreamsForTesting(t)
+		c := &GraphCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				Ui:               ui,
+				Streams:          streams,
+				WorkingDir:       wd,
+			},
+		}
+
+		args := []string{}
+		if code := c.Run(args); code != 0 {
+			output := closeStreams(t)
+			stderr := ui.ErrorWriter.String()
+			t.Fatalf("bad:\nstdout:\n%s\n\nstderr:\n%s", output.Stdout(), stderr)
+		}
+
+		output := closeStreams(t)
+		wantOutput := []string{
+			`"module.child.test_instance.test" [label="test_instance.test"]`,
+		}
+		for _, want := range wantOutput {
+			if !strings.Contains(output.Stdout(), want) {
+				t.Fatalf("output missing %s:\n%s", want, output.Stdout())
+			}
+		}
+	})
 }

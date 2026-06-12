@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package stackplan
@@ -13,11 +13,11 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/collections"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/planfile"
 	"github.com/hashicorp/terraform/internal/plans/planproto"
-	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/tfstackdata1"
 	"github.com/hashicorp/terraform/internal/states"
@@ -133,9 +133,9 @@ func (l *Loader) AddRaw(rawMsg *anypb.Any) error {
 			l.ret.ApplyTimeInputVariables.Add(addr)
 		}
 
-	case *tfstackdata1.ProviderFunctionResults:
-		for _, hash := range msg.ProviderFunctionResults {
-			l.ret.ProviderFunctionResults = append(l.ret.ProviderFunctionResults, providers.FunctionHash{
+	case *tfstackdata1.FunctionResults:
+		for _, hash := range msg.FunctionResults {
+			l.ret.FunctionResults = append(l.ret.FunctionResults, lang.FunctionResultHash{
 				Key:    hash.Key,
 				Result: hash.Result,
 			})
@@ -212,9 +212,9 @@ func (l *Loader) AddRaw(rawMsg *anypb.Any) error {
 			return fmt.Errorf("decoding check results: %w", err)
 		}
 
-		var functionResults []providers.FunctionHash
-		for _, hash := range msg.ProviderFunctionResults {
-			functionResults = append(functionResults, providers.FunctionHash{
+		var functionResults []lang.FunctionResultHash
+		for _, hash := range msg.FunctionResults {
+			functionResults = append(functionResults, lang.FunctionResultHash{
 				Key:    hash.Key,
 				Result: hash.Result,
 			})
@@ -237,6 +237,8 @@ func (l *Loader) AddRaw(rawMsg *anypb.Any) error {
 			ResourceInstancePriorState:      addrs.MakeMap[addrs.AbsResourceInstanceObject, *states.ResourceInstanceObjectSrc](),
 			ResourceInstanceProviderConfig:  addrs.MakeMap[addrs.AbsResourceInstanceObject, addrs.AbsProviderConfig](),
 			DeferredResourceInstanceChanges: addrs.MakeMap[addrs.AbsResourceInstanceObject, *plans.DeferredResourceInstanceChangeSrc](),
+			ActionInvocations:               make([]*plans.ActionInvocationInstanceSrc, 0),
+			DeferredActionInvocations:       make([]*plans.DeferredActionInvocationSrc, 0),
 		})
 		err = c.PlanTimestamp.UnmarshalText([]byte(msg.PlanTimestamp))
 		if err != nil {
@@ -299,6 +301,44 @@ func (l *Loader) AddRaw(rawMsg *anypb.Any) error {
 		c.DeferredResourceInstanceChanges.Put(fullAddr, &plans.DeferredResourceInstanceChangeSrc{
 			ChangeSrc:      riPlan,
 			DeferredReason: deferredReason,
+		})
+
+	case *tfstackdata1.PlanActionInvocationPlanned:
+		c, fullAddr, err := LoadComponentForActionInvocation(l.ret, msg)
+		if err != nil {
+			return err
+		}
+
+		action, err := ValidateActionInvocation(msg, fullAddr)
+		if err != nil {
+			return err
+		}
+		if action != nil {
+			c.ActionInvocations = append(c.ActionInvocations, action)
+		}
+
+	case *tfstackdata1.PlanDeferredActionInvocation:
+		if msg.Deferred == nil {
+			return fmt.Errorf("missing deferred from PlanDeferredActionInvocation")
+		}
+		if msg.Invocation == nil {
+			return fmt.Errorf("missing invocation from PlanDeferredActionInvocation")
+		}
+
+		c, fullAddr, err := LoadComponentForActionInvocation(l.ret, msg.Invocation)
+		if err != nil {
+			return err
+		}
+
+		action, err := ValidateActionInvocation(msg.Invocation, fullAddr)
+		if err != nil {
+			return err
+		}
+
+		deferredReason, _ := planfile.DeferredReasonFromProto(msg.Deferred.Reason)
+		c.DeferredActionInvocations = append(c.DeferredActionInvocations, &plans.DeferredActionInvocationSrc{
+			DeferredReason:              deferredReason,
+			ActionInvocationInstanceSrc: action,
 		})
 
 	default:
@@ -468,4 +508,43 @@ func LoadComponentForPartialResourceInstance(plan *Plan, change *tfstackdata1.Pl
 	}
 
 	return c, fullAddr, providerConfigAddr, nil
+}
+
+func ValidateActionInvocation(change *tfstackdata1.PlanActionInvocationPlanned, fullAddr stackaddrs.AbsActionInvocationInstance) (*plans.ActionInvocationInstanceSrc, error) {
+	if change.Invocation == nil {
+		return nil, nil
+	}
+
+	action, err := planfile.ActionInvocationFromProto(change.Invocation)
+	if err != nil {
+		return nil, fmt.Errorf("invalid action invocation: %w", err)
+	}
+	if !action.Addr.Equal(fullAddr.Item) {
+		return nil, fmt.Errorf("planned action invocation has inconsistent address to its containing object")
+	}
+	return action, nil
+}
+
+func LoadComponentForActionInvocation(plan *Plan, change *tfstackdata1.PlanActionInvocationPlanned) (*Component, stackaddrs.AbsActionInvocationInstance, error) {
+	cAddr, diags := stackaddrs.ParsePartialComponentInstanceStr(change.ComponentInstanceAddr)
+	if diags.HasErrors() {
+		return nil, stackaddrs.AbsActionInvocationInstance{}, fmt.Errorf("invalid component instance address syntax in %q", change.ComponentInstanceAddr)
+	}
+
+	actionAddr, diags := addrs.ParseAbsActionInstanceStr(change.ActionInvocationAddr)
+	if diags.HasErrors() {
+		return nil, stackaddrs.AbsActionInvocationInstance{}, fmt.Errorf("invalid action invocation address syntax in %q", change.ActionInvocationAddr)
+	}
+
+	fullAddr := stackaddrs.AbsActionInvocationInstance{
+		Component: cAddr,
+		Item:      actionAddr,
+	}
+
+	c, ok := plan.Root.GetOk(cAddr)
+	if !ok {
+		return nil, stackaddrs.AbsActionInvocationInstance{}, fmt.Errorf("action invocation change for unannounced component instance %s", cAddr)
+	}
+
+	return c, fullAddr, nil
 }

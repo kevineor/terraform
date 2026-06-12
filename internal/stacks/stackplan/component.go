@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package stackplan
@@ -11,8 +11,8 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/collections"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/plans"
-	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/states"
 )
@@ -52,6 +52,14 @@ type Component struct {
 	// that have changes that are deferred to a later plan and apply cycle.
 	DeferredResourceInstanceChanges addrs.Map[addrs.AbsResourceInstanceObject, *plans.DeferredResourceInstanceChangeSrc]
 
+	// ActionInvocations describes planned action invocations that should be
+	// preserved into the modules runtime apply plan.
+	ActionInvocations []*plans.ActionInvocationInstanceSrc
+
+	// DeferredActionInvocations describes action invocations that were deferred
+	// to a later plan and apply cycle.
+	DeferredActionInvocations []*plans.DeferredActionInvocationSrc
+
 	// PlanTimestamp is the time Terraform Core recorded as the single "plan
 	// timestamp", which is used only for the result of the "plantimestamp"
 	// function during apply and must not be used for any other purpose.
@@ -69,7 +77,7 @@ type Component struct {
 	// PlannedFunctionResults is a shared table of results from calling
 	// provider functions. This is stored and loaded from during the planning
 	// stage to use during apply operations.
-	PlannedFunctionResults []providers.FunctionHash
+	PlannedFunctionResults []lang.FunctionResultHash
 
 	// PlannedInputValues and PlannedInputValueMarks are the values that
 	// Terraform has planned to use for input variables in this component.
@@ -98,19 +106,31 @@ type Component struct {
 func (c *Component) ForModulesRuntime() (*plans.Plan, error) {
 	changes := &plans.ChangesSrc{}
 	plan := &plans.Plan{
-		UIMode:                  c.Mode,
-		Changes:                 changes,
-		Timestamp:               c.PlanTimestamp,
-		Applyable:               c.PlanApplyable,
-		Complete:                c.PlanComplete,
-		Checks:                  c.PlannedChecks,
-		ProviderFunctionResults: c.PlannedFunctionResults,
+		UIMode:          c.Mode,
+		Changes:         changes,
+		Timestamp:       c.PlanTimestamp,
+		Applyable:       c.PlanApplyable,
+		Complete:        c.PlanComplete,
+		Checks:          c.PlannedChecks,
+		FunctionResults: c.PlannedFunctionResults,
 	}
 
 	for _, elem := range c.ResourceInstancePlanned.Elems {
 		changeSrc := elem.Value
 		if changeSrc != nil {
 			changes.Resources = append(changes.Resources, changeSrc)
+		}
+	}
+
+	for _, action := range c.ActionInvocations {
+		if action != nil {
+			changes.ActionInvocations = append(changes.ActionInvocations, action)
+		}
+	}
+
+	for _, deferredAction := range c.DeferredActionInvocations {
+		if deferredAction != nil {
+			plan.DeferredActionInvocations = append(plan.DeferredActionInvocations, deferredAction)
 		}
 	}
 
@@ -161,6 +181,24 @@ func (c *Component) RequiredProviderInstances() addrs.Set[addrs.RootProviderConf
 		providerInstances.Add(addrs.RootProviderConfig{
 			Provider: elem.Value.Provider,
 			Alias:    elem.Value.Alias,
+		})
+	}
+	for _, action := range c.ActionInvocations {
+		if action == nil {
+			continue
+		}
+		providerInstances.Add(addrs.RootProviderConfig{
+			Provider: action.ProviderAddr.Provider,
+			Alias:    action.ProviderAddr.Alias,
+		})
+	}
+	for _, deferredAction := range c.DeferredActionInvocations {
+		if deferredAction == nil || deferredAction.ActionInvocationInstanceSrc == nil {
+			continue
+		}
+		providerInstances.Add(addrs.RootProviderConfig{
+			Provider: deferredAction.ActionInvocationInstanceSrc.ProviderAddr.Provider,
+			Alias:    deferredAction.ActionInvocationInstanceSrc.ProviderAddr.Alias,
 		})
 	}
 	return providerInstances

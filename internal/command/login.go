@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -261,6 +261,7 @@ func (c *LoginCommand) Run(args []string) int {
 			c.outputDefaultTFCLoginSuccess()
 			return 0
 		}
+		defer resp.Body.Close()
 
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
@@ -268,8 +269,6 @@ func (c *LoginCommand) Run(args []string) int {
 			c.outputDefaultTFCLoginSuccess()
 			return 0
 		}
-
-		defer resp.Body.Close()
 		json.Unmarshal(body, &motd)
 
 		if motd.Errors == nil && motd.Message != "" {

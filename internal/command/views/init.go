@@ -1,21 +1,22 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package views
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/hashicorp/terraform/internal/command/arguments"
+	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
 // The Init view is used for the init command.
 type Init interface {
 	Diagnostics(diags tfdiags.Diagnostics)
+	PolicyResults(results *plans.PolicyResults, setupDiags policy.Diagnostics)
 	Output(messageCode InitMessageCode, params ...any)
 	LogInitMessage(messageCode InitMessageCode, params ...any)
 	Log(message string, params ...any)
@@ -48,6 +49,10 @@ var _ Init = (*InitHuman)(nil)
 
 func (v *InitHuman) Diagnostics(diags tfdiags.Diagnostics) {
 	v.view.Diagnostics(diags)
+}
+
+func (v *InitHuman) PolicyResults(results *plans.PolicyResults, setupDiags policy.Diagnostics) {
+	v.view.PolicyResults(results, setupDiags)
 }
 
 func (v *InitHuman) Output(messageCode InitMessageCode, params ...any) {
@@ -90,6 +95,10 @@ func (v *InitJSON) Diagnostics(diags tfdiags.Diagnostics) {
 	v.view.Diagnostics(diags)
 }
 
+func (v *InitJSON) PolicyResults(results *plans.PolicyResults, setupDiags policy.Diagnostics) {
+	v.view.PolicyResults(results, setupDiags)
+}
+
 func (v *InitJSON) Output(messageCode InitMessageCode, params ...any) {
 	// don't add empty messages to json output
 	preppedMessage := v.PrepareMessage(messageCode, params...)
@@ -97,18 +106,21 @@ func (v *InitJSON) Output(messageCode InitMessageCode, params ...any) {
 		return
 	}
 
-	current_timestamp := time.Now().UTC().Format(time.RFC3339)
-	json_data := map[string]string{
-		"@level":       "info",
-		"@message":     preppedMessage,
-		"@module":      "terraform.ui",
-		"@timestamp":   current_timestamp,
-		"type":         "init_output",
-		"message_code": string(messageCode),
-	}
-
-	init_output, _ := json.Marshal(json_data)
-	v.view.view.streams.Println(string(init_output))
+	// Logged data includes by default:
+	// @level as "info"
+	// @module as "terraform.ui" (See NewJSONView)
+	// @timestamp formatted in the default way
+	//
+	// In the method below we:
+	// * Set @message as the first argument value
+	// * Annotate with extra data:
+	//     "type":"init_output"
+	//     "message_code":"<value>"
+	v.view.log.Info(
+		preppedMessage,
+		"type", "init_output",
+		"message_code", string(messageCode),
+	)
 }
 
 func (v *InitJSON) LogInitMessage(messageCode InitMessageCode, params ...any) {
@@ -186,6 +198,26 @@ var MessageRegistry map[InitMessageCode]InitMessage = map[InitMessageCode]InitMe
 		HumanValue: "\n[reset][bold]Initializing provider plugins...",
 		JSONValue:  "Initializing provider plugins...",
 	},
+	"initializing_state_store_provider_plugin_message": {
+		HumanValue: "\n[reset][bold]Initializing provider plugin for state store %q...",
+		JSONValue:  "Initializing provider plugin for state store %q...",
+	},
+	"initializing_state_store_message": {
+		HumanValue: "\n[reset][bold]Initializing the state store %q...",
+		JSONValue:  "Initializing the state store %q...",
+	},
+	"state_store_provider_interactive_approved_message": {
+		HumanValue: "\n[reset][bold]The state store provider was approved by the user.",
+		JSONValue:  "The state store provider was approved by the user.",
+	},
+	"state_store_provider_interactive_rejected_message": {
+		HumanValue: "\n[reset][bold]The state store provider was rejected by the user.",
+		JSONValue:  "The state store provider was rejected by the user.",
+	},
+	"state_store_provider_automation_approved_message": {
+		HumanValue: "\n[reset][bold]The state store provider was approved automatically.",
+		JSONValue:  "The state store provider was approved automatically.",
+	},
 	"dependencies_lock_changes_info": {
 		HumanValue: dependenciesLockChangesInfo,
 		JSONValue:  dependenciesLockChangesInfo,
@@ -238,6 +270,66 @@ var MessageRegistry map[InitMessageCode]InitMessage = map[InitMessageCode]InitMe
 		HumanValue: errInitConfigError,
 		JSONValue:  errInitConfigErrorJSON,
 	},
+	"state_store_unset": {
+		HumanValue: "[reset][green]\n\nSuccessfully unset the state store %q. Terraform will now operate locally.",
+		JSONValue:  "Successfully unset the state store %q. Terraform will now operate locally.",
+	},
+	"state_store_migrate_backend": {
+		HumanValue: "Migrating from %q state store to %q backend.",
+		JSONValue:  "Migrating from %q state store to %q backend.",
+	},
+	"backend_configured_success": {
+		HumanValue: backendConfiguredSuccessHuman,
+		JSONValue:  backendConfiguredSuccessJSON,
+	},
+	"backend_configured_unset": {
+		HumanValue: backendConfiguredUnsetHuman,
+		JSONValue:  backendConfiguredUnsetJSON,
+	},
+	"backend_migrate_to_cloud": {
+		HumanValue: "Migrating from backend %q to HCP Terraform.",
+		JSONValue:  "Migrating from backend %q to HCP Terraform.",
+	},
+	"backend_migrate_from_cloud": {
+		HumanValue: "Migrating from HCP Terraform to backend %q.",
+		JSONValue:  "Migrating from HCP Terraform to backend %q.",
+	},
+	"backend_cloud_change_in_place": {
+		HumanValue: "HCP Terraform configuration has changed.",
+		JSONValue:  "HCP Terraform configuration has changed.",
+	},
+	"backend_migrate_type_change": {
+		HumanValue: backendMigrateTypeChangeHuman,
+		JSONValue:  backendMigrateTypeChangeJSON,
+	},
+	"backend_reconfigure": {
+		HumanValue: backendReconfigureHuman,
+		JSONValue:  backendReconfigureJSON,
+	},
+	"backend_migrate_local": {
+		HumanValue: backendMigrateLocalHuman,
+		JSONValue:  backendMigrateLocalJSON,
+	},
+	"backend_cloud_migrate_local": {
+		HumanValue: "Migrating from HCP Terraform or Terraform Enterprise to local state.",
+		JSONValue:  "Migrating from HCP Terraform or Terraform Enterprise to local state.",
+	},
+	"backend_cloud_migrate_state_store": {
+		HumanValue: "Migrating from HCP Terraform Terraform Enterprise to state store %q.",
+		JSONValue:  "Migrating from HCP Terraform Terraform Enterprise to state store %q.",
+	},
+	"backend_migrate_state_store": {
+		HumanValue: "Migrating from backend %q to state store %q.",
+		JSONValue:  "Migrating from backend %q to state store %q.",
+	},
+	"state_store_migrate_local": {
+		HumanValue: stateMigrateLocalHuman,
+		JSONValue:  stateMigrateLocalJSON,
+	},
+	"state_store_migrate_state_store": {
+		HumanValue: "Migrating from state store %q (%s) to %q (%s). Reason: %s.",
+		JSONValue:  "Migrating from state store %q (%s) to %q (%s). Reason: %s.",
+	},
 	"empty_message": {
 		HumanValue: "",
 		JSONValue:  "",
@@ -247,31 +339,79 @@ var MessageRegistry map[InitMessageCode]InitMessage = map[InitMessageCode]InitMe
 type InitMessageCode string
 
 const (
-	CopyingConfigurationMessage         InitMessageCode = "copying_configuration_message"
-	EmptyMessage                        InitMessageCode = "empty_message"
-	OutputInitEmptyMessage              InitMessageCode = "output_init_empty_message"
-	OutputInitSuccessMessage            InitMessageCode = "output_init_success_message"
-	OutputInitSuccessCloudMessage       InitMessageCode = "output_init_success_cloud_message"
-	OutputInitSuccessCLIMessage         InitMessageCode = "output_init_success_cli_message"
-	OutputInitSuccessCLICloudMessage    InitMessageCode = "output_init_success_cli_cloud_message"
-	UpgradingModulesMessage             InitMessageCode = "upgrading_modules_message"
-	InitializingTerraformCloudMessage   InitMessageCode = "initializing_terraform_cloud_message"
-	InitializingModulesMessage          InitMessageCode = "initializing_modules_message"
-	InitializingBackendMessage          InitMessageCode = "initializing_backend_message"
-	InitializingProviderPluginMessage   InitMessageCode = "initializing_provider_plugin_message"
-	LockInfo                            InitMessageCode = "lock_info"
-	DependenciesLockChangesInfo         InitMessageCode = "dependencies_lock_changes_info"
-	ProviderAlreadyInstalledMessage     InitMessageCode = "provider_already_installed_message"
-	BuiltInProviderAvailableMessage     InitMessageCode = "built_in_provider_available_message"
-	ReusingPreviousVersionInfo          InitMessageCode = "reusing_previous_version_info"
-	FindingMatchingVersionMessage       InitMessageCode = "finding_matching_version_message"
-	FindingLatestVersionMessage         InitMessageCode = "finding_latest_version_message"
-	UsingProviderFromCacheDirInfo       InitMessageCode = "using_provider_from_cache_dir_info"
-	InstallingProviderMessage           InitMessageCode = "installing_provider_message"
-	KeyID                               InitMessageCode = "key_id"
-	InstalledProviderVersionInfo        InitMessageCode = "installed_provider_version_info"
+	// Following message codes are used and documented EXTERNALLY
+	// Keep docs/internals/machine-readable-ui.mdx up to date with
+	// this list when making changes here.
+	CopyingConfigurationMessage                  InitMessageCode = "copying_configuration_message"
+	EmptyMessage                                 InitMessageCode = "empty_message"
+	OutputInitEmptyMessage                       InitMessageCode = "output_init_empty_message"
+	OutputInitSuccessMessage                     InitMessageCode = "output_init_success_message"
+	OutputInitSuccessCloudMessage                InitMessageCode = "output_init_success_cloud_message"
+	OutputInitSuccessCLIMessage                  InitMessageCode = "output_init_success_cli_message"
+	OutputInitSuccessCLICloudMessage             InitMessageCode = "output_init_success_cli_cloud_message"
+	UpgradingModulesMessage                      InitMessageCode = "upgrading_modules_message"
+	InitializingTerraformCloudMessage            InitMessageCode = "initializing_terraform_cloud_message"
+	InitializingModulesMessage                   InitMessageCode = "initializing_modules_message"
+	InitializingBackendMessage                   InitMessageCode = "initializing_backend_message"
+	InitializingStateStoreMessage                InitMessageCode = "initializing_state_store_message"
+	InitializingStateStoreProviderPluginMessage  InitMessageCode = "initializing_state_store_provider_plugin_message"
+	StateStoreProviderInteractiveApprovedMessage InitMessageCode = "state_store_provider_interactive_approved_message"
+	StateStoreProviderInteractiveRejectedMessage InitMessageCode = "state_store_provider_interactive_rejected_message"
+	StateStoreProviderAutomationApprovedMessage  InitMessageCode = "state_store_provider_automation_approved_message"
+	InitializingProviderPluginMessage            InitMessageCode = "initializing_provider_plugin_message"
+	LockInfo                                     InitMessageCode = "lock_info"
+	DependenciesLockChangesInfo                  InitMessageCode = "dependencies_lock_changes_info"
+
+	//// Message codes below are ONLY used INTERNALLY (for now)
+
+	// InitConfigError indicates problems encountered during initialisation
+	InitConfigError InitMessageCode = "init_config_error"
+	// BackendConfiguredSuccessMessage indicates successful backend configuration
+	BackendConfiguredSuccessMessage InitMessageCode = "backend_configured_success"
+	// BackendConfiguredUnsetMessage indicates successful backend unsetting
+	BackendConfiguredUnsetMessage InitMessageCode = "backend_configured_unset"
+	// BackendMigrateToCloudMessage indicates migration to HCP Terraform
+	BackendMigrateToCloudMessage InitMessageCode = "backend_migrate_to_cloud"
+	// BackendMigrateFromCloudMessage indicates migration from HCP Terraform
+	BackendMigrateFromCloudMessage InitMessageCode = "backend_migrate_from_cloud"
+	// BackendCloudChangeInPlaceMessage indicates HCP Terraform configuration change
+	BackendCloudChangeInPlaceMessage InitMessageCode = "backend_cloud_change_in_place"
+	// BackendMigrateTypeChangeMessage indicates backend type change
+	BackendMigrateTypeChangeMessage InitMessageCode = "backend_migrate_type_change"
+	// BackendReconfigureMessage indicates backend reconfiguration
+	BackendReconfigureMessage InitMessageCode = "backend_reconfigure"
+	// BackendMigrateLocalMessage indicates migration to local backend
+	BackendMigrateLocalMessage InitMessageCode = "backend_migrate_local"
+	// BackendCloudMigrateLocalMessage indicates migration from cloud to local
+	BackendCloudMigrateLocalMessage InitMessageCode = "backend_cloud_migrate_local"
+	// BackendCloudMigrateStateStoreMessage indicates migration from cloud to a state store
+	BackendCloudMigrateStateStoreMessage InitMessageCode = "backend_cloud_migrate_state_store"
+	// BackendMigrateStateStoreMessage indicates migration from a backend to a state store
+	BackendMigrateStateStoreMessage InitMessageCode = "backend_migrate_state_store"
+	// StateMigrateLocalMessage indicates migration from state store to local
+	StateMigrateLocalMessage InitMessageCode = "state_store_migrate_local"
+	// StateStoreMigrationMessage indicates migration from state store to state store
+	StateStoreMigrationMessage InitMessageCode = "state_store_migrate_state_store"
+	// FindingMatchingVersionMessage indicates that Terraform is looking for a provider version that matches the constraint during installation
+	FindingMatchingVersionMessage InitMessageCode = "finding_matching_version_message"
+	// InstalledProviderVersionInfo describes a successfully installed provider along with its version
+	InstalledProviderVersionInfo InitMessageCode = "installed_provider_version_info"
+	// ReusingPreviousVersionInfo indicates a provider which is locked to a specific version during installation
+	ReusingPreviousVersionInfo InitMessageCode = "reusing_previous_version_info"
+	// BuiltInProviderAvailableMessage indicates a built-in provider in use during installation
+	BuiltInProviderAvailableMessage InitMessageCode = "built_in_provider_available_message"
+	// ProviderAlreadyInstalledMessage indicates a provider that is already installed during installation
+	ProviderAlreadyInstalledMessage InitMessageCode = "provider_already_installed_message"
+	// KeyID indicates the key ID used to sign of a successfully installed provider
+	KeyID InitMessageCode = "key_id"
+	// InstallingProviderMessage indicates that a provider is being installed (from a remote location)
+	InstallingProviderMessage InitMessageCode = "installing_provider_message"
+	// FindingLatestVersionMessage indicates that Terraform is looking for the latest version of a provider during installation (no constraint was supplied)
+	FindingLatestVersionMessage InitMessageCode = "finding_latest_version_message"
+	// UsingProviderFromCacheDirInfo indicates that a provider is being linked from a system-wide cache
+	UsingProviderFromCacheDirInfo InitMessageCode = "using_provider_from_cache_dir_info"
+	// PartnerAndCommunityProvidersMessage is a message concerning partner and community providers and how these are signed
 	PartnerAndCommunityProvidersMessage InitMessageCode = "partner_and_community_providers_message"
-	InitConfigError                     InitMessageCode = "init_config_error"
 )
 
 const outputInitEmpty = `
@@ -376,3 +516,40 @@ with the configuration, described below.
 The Terraform configuration must be valid before initialization so that
 Terraform can determine which modules and providers need to be installed.
 `
+
+const backendConfiguredSuccessHuman = `[reset][green]
+Successfully configured the backend %q! Terraform will automatically
+use this backend unless the backend configuration changes.`
+
+const backendConfiguredSuccessJSON = `Successfully configured the backend %q! Terraform will automatically
+use this backend unless the backend configuration changes.`
+
+const backendConfiguredUnsetHuman = `[reset][green]
+
+Successfully unset the backend %q. Terraform will now operate locally.`
+
+const backendConfiguredUnsetJSON = `Successfully unset the backend %q. Terraform will now operate locally.`
+
+const backendMigrateTypeChangeHuman = `[reset]Terraform detected that the backend type changed from %q to %q.
+`
+
+const backendMigrateTypeChangeJSON = `Terraform detected that the backend type changed from %q to %q.`
+
+const backendReconfigureHuman = `[reset][bold]Backend configuration changed![reset]
+
+Terraform has detected that the configuration specified for the backend
+has changed. Terraform will now check for existing state in the backends.
+`
+
+const backendReconfigureJSON = `Backend configuration changed!
+
+Terraform has detected that the configuration specified for the backend
+has changed. Terraform will now check for existing state in the backends.`
+
+const backendMigrateLocalHuman = `Terraform has detected you're unconfiguring your previously set %q backend.`
+
+const backendMigrateLocalJSON = `Terraform has detected you're unconfiguring your previously set %q backend.`
+
+const stateMigrateLocalHuman = `Terraform has detected you're unconfiguring your previously set %q state store.`
+
+const stateMigrateLocalJSON = `Terraform has detected you're unconfiguring your previously set %q state store.`

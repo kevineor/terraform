@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package stackplan
@@ -11,9 +11,14 @@ import (
 	"github.com/zclconf/go-cty/cty"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/collections"
+	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/lang/marks"
+	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/plans/planfile"
 	"github.com/hashicorp/terraform/internal/plans/planproto"
+	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/tfstackdata1"
 )
@@ -92,10 +97,7 @@ func TestAddRaw(t *testing.T) {
 
 			opts := cmp.Options{
 				ctydebug.CmpOptions,
-				cmpCollectionsSet[stackaddrs.InputVariable](),
-				cmpCollectionsSet[stackaddrs.OutputValue](),
-				cmpCollectionsSet[stackaddrs.AbsComponentInstance](),
-				cmpCollectionsMap[stackaddrs.AbsComponentInstance, *Component](),
+				collections.CmpOptions,
 			}
 			if diff := cmp.Diff(test.Want, loader.ret, opts...); diff != "" {
 				t.Errorf("AddRaw() mismatch (-want +got):\n%s", diff)
@@ -104,38 +106,108 @@ func TestAddRaw(t *testing.T) {
 	}
 }
 
-func cmpCollectionsSet[V any]() cmp.Option {
-	return cmp.Comparer(func(x, y collections.Set[V]) bool {
-		if x.Len() != y.Len() {
-			return false
-		}
+func TestAddRaw_ActionInvocations(t *testing.T) {
+	provider := addrs.MustParseProviderSourceString("example.com/test/actions")
+	providerConfig := addrs.AbsProviderConfig{
+		Module:   addrs.RootModule,
+		Provider: provider,
+	}
+	action := &plans.ActionInvocationInstanceSrc{
+		Addr: addrs.RootModuleInstance.ActionInstance("webhook", "notify", addrs.NoKey),
+		ActionTrigger: &plans.ResourceActionTrigger{
+			TriggeringResourceAddr:  addrs.RootModuleInstance.ResourceInstance(addrs.ManagedResourceMode, "example_resource", "main", addrs.NoKey),
+			ActionTriggerEvent:      configs.AfterCreate,
+			ActionTriggerBlockIndex: 0,
+			ActionsListIndex:        0,
+		},
+		ProviderAddr: providerConfig,
+	}
+	rawAction, err := planfile.ActionInvocationToProto(action)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		for v := range x.All() {
-			if !y.Has(v) {
-				return false
-			}
-		}
+	loader := NewLoader()
+	err = loader.AddRaw(mustMarshalAnyPb(&tfstackdata1.PlanComponentInstance{
+		ComponentInstanceAddr: "component.web",
+		PlannedAction:         planproto.Action_NOOP,
+		Mode:                  planproto.Mode_NORMAL,
+		PlanTimestamp:         "2017-03-27T10:00:00-08:00",
+	}))
+	if err != nil {
+		t.Fatalf("adding component: %v", err)
+	}
+	err = loader.AddRaw(mustMarshalAnyPb(&tfstackdata1.PlanActionInvocationPlanned{
+		ComponentInstanceAddr: "component.web",
+		ActionInvocationAddr:  action.Addr.String(),
+		ProviderConfigAddr:    provider.String(),
+		Invocation:            rawAction,
+	}))
+	if err != nil {
+		t.Fatalf("adding planned action invocation: %v", err)
+	}
+	err = loader.AddRaw(mustMarshalAnyPb(&tfstackdata1.PlanDeferredActionInvocation{
+		Deferred: &planproto.Deferred{
+			Reason: planproto.DeferredReason_DEFERRED_PREREQ,
+		},
+		Invocation: &tfstackdata1.PlanActionInvocationPlanned{
+			ComponentInstanceAddr: "component.web",
+			ActionInvocationAddr:  action.Addr.String(),
+			ProviderConfigAddr:    provider.String(),
+			Invocation:            rawAction,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("adding deferred action invocation: %v", err)
+	}
 
-		return true
-	})
-}
+	componentAddr, diags := stackaddrs.ParseAbsComponentInstanceStr("component.web")
+	if diags.HasErrors() {
+		t.Fatalf("parsing component address: %s", diags.Err())
+	}
+	component := loader.ret.GetComponent(componentAddr)
+	if component == nil {
+		t.Fatal("expected component to be loaded")
+	}
 
-func cmpCollectionsMap[K, V any]() cmp.Option {
-	return cmp.Comparer(func(x, y collections.Map[K, V]) bool {
-		if x.Len() != y.Len() {
-			return false
-		}
+	if len(component.ActionInvocations) != 1 {
+		t.Fatalf("expected 1 planned action invocation, got %d", len(component.ActionInvocations))
+	}
+	if diff := cmp.Diff(action, component.ActionInvocations[0], ctydebug.CmpOptions); diff != "" {
+		t.Fatalf("wrong planned action invocation (-want +got):\n%s", diff)
+	}
+	if len(component.DeferredActionInvocations) != 1 {
+		t.Fatalf("expected 1 deferred action invocation, got %d", len(component.DeferredActionInvocations))
+	}
+	if diff := cmp.Diff(&plans.DeferredActionInvocationSrc{
+		DeferredReason:              providers.DeferredReasonDeferredPrereq,
+		ActionInvocationInstanceSrc: action,
+	}, component.DeferredActionInvocations[0], ctydebug.CmpOptions); diff != "" {
+		t.Fatalf("wrong deferred action invocation (-want +got):\n%s", diff)
+	}
 
-		for key, entry := range x.All() {
-			if !y.HasKey(key) {
-				return false
-			}
+	modulesPlan, err := component.ForModulesRuntime()
+	if err != nil {
+		t.Fatalf("ForModulesRuntime: %v", err)
+	}
+	if len(modulesPlan.Changes.ActionInvocations) != 1 {
+		t.Fatalf("expected 1 planned action invocation in modules runtime plan, got %d", len(modulesPlan.Changes.ActionInvocations))
+	}
+	if diff := cmp.Diff(action, modulesPlan.Changes.ActionInvocations[0], ctydebug.CmpOptions); diff != "" {
+		t.Fatalf("wrong modules runtime action invocation (-want +got):\n%s", diff)
+	}
+	if len(modulesPlan.DeferredActionInvocations) != 1 {
+		t.Fatalf("expected 1 deferred action invocation in modules runtime plan, got %d", len(modulesPlan.DeferredActionInvocations))
+	}
+	if diff := cmp.Diff(&plans.DeferredActionInvocationSrc{
+		DeferredReason:              providers.DeferredReasonDeferredPrereq,
+		ActionInvocationInstanceSrc: action,
+	}, modulesPlan.DeferredActionInvocations[0], ctydebug.CmpOptions); diff != "" {
+		t.Fatalf("wrong modules runtime deferred action invocation (-want +got):\n%s", diff)
+	}
 
-			if !cmp.Equal(entry, y.Get(key)) {
-				return false
-			}
-		}
-
-		return true
-	})
+	requiredProviders := component.RequiredProviderInstances()
+	if !requiredProviders.Has(addrs.RootProviderConfig{Provider: provider}) {
+		t.Fatalf("expected action provider %s to be required", provider)
+	}
 }

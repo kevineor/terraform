@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -12,8 +12,10 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/configs"
+	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -39,6 +41,23 @@ type ApplyOpts struct {
 	// values that were declared as ephemeral, because all other input
 	// values must retain the values that were specified during planning.
 	SetVariables InputValues
+
+	// AllowRootEphemeralOutputs overrides a specific check made within the
+	// output nodes that they cannot be ephemeral at within root modules. This
+	// should be set to true for plans executing from within either the stacks
+	// or test runtimes, where the root modules as Terraform sees them aren't
+	// the actual root modules.
+	AllowRootEphemeralOutputs bool
+
+	// ProviderLocks is a read-only snapshot of provider locks (from the dependency lock
+	// file). This is required by policy evaluations against providers to access version information.
+	ProviderLocks map[addrs.Provider]*depsfile.ProviderLock
+
+	// Optional policy client.
+	// When set, policy evaluation logic will be executed in the graph.
+	// When nil, that logic will be skipped.
+	PolicyClient  policy.Client
+	PolicyResults *plans.PolicyResults
 }
 
 // ApplyOpts creates an [ApplyOpts] with copies of all of the elements that
@@ -52,7 +71,9 @@ type ApplyOpts struct {
 // as in test cases.
 func (po *PlanOpts) ApplyOpts() *ApplyOpts {
 	return &ApplyOpts{
-		ExternalProviders: po.ExternalProviders,
+		ExternalProviders:         po.ExternalProviders,
+		AllowRootEphemeralOutputs: po.AllowRootEphemeralOutputs,
+		ProviderLocks:             po.ProviderLocks,
 	}
 }
 
@@ -198,7 +219,11 @@ func (c *Context) ApplyAndEval(plan *plans.Plan, config *configs.Config, opts *A
 		// We also want to propagate the timestamp from the plan file.
 		PlanTimeTimestamp: plan.Timestamp,
 
-		ProviderFuncResults: providers.NewFunctionResultsTable(plan.ProviderFunctionResults),
+		FunctionResults: lang.NewFunctionResultsTable(plan.FunctionResults),
+
+		ProviderLocks: opts.ProviderLocks,
+		PolicyClient:  opts.PolicyClient,
+		PolicyResults: opts.PolicyResults,
 	})
 	diags = diags.Append(walker.NonFatalDiagnostics)
 	diags = diags.Append(walkDiags)
@@ -292,6 +317,10 @@ func checkApplyTimeVariables(needed collections.Set[string], gotValues InputValu
 func (c *Context) applyGraph(plan *plans.Plan, config *configs.Config, opts *ApplyOpts, validate bool) (*Graph, walkOperation, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
+	if opts == nil {
+		opts = new(ApplyOpts)
+	}
+
 	variables := InputValues{}
 	for name, dyVal := range plan.VariableValues {
 		val, err := dyVal.Decode(cty.DynamicPseudoType)
@@ -316,10 +345,8 @@ func (c *Context) applyGraph(plan *plans.Plan, config *configs.Config, opts *App
 	// FIXME: We should check that all of these match declared variables and
 	// that all of them are declared as ephemeral, because all non-ephemeral
 	// variables are supposed to come exclusively from plan.VariableValues.
-	if opts != nil {
-		for n, vv := range opts.SetVariables {
-			variables[n] = vv
-		}
+	for n, vv := range opts.SetVariables {
+		variables[n] = vv
 	}
 	if diags.HasErrors() {
 		return nil, walkApply, diags
@@ -352,25 +379,23 @@ func (c *Context) applyGraph(plan *plans.Plan, config *configs.Config, opts *App
 		operation = walkDestroy
 	}
 
-	var externalProviderConfigs map[addrs.RootProviderConfig]providers.Interface
-	if opts != nil {
-		externalProviderConfigs = opts.ExternalProviders
-	}
-
 	graph, moreDiags := (&ApplyGraphBuilder{
-		Config:                  config,
-		Changes:                 plan.Changes,
-		DeferredChanges:         plan.DeferredResources,
-		State:                   plan.PriorState,
-		RootVariableValues:      variables,
-		ExternalProviderConfigs: externalProviderConfigs,
-		Plugins:                 c.plugins,
-		Targets:                 plan.TargetAddrs,
-		ForceReplace:            plan.ForceReplaceAddrs,
-		Operation:               operation,
-		ExternalReferences:      plan.ExternalReferences,
-		Overrides:               plan.Overrides,
-		SkipGraphValidation:     c.graphOpts.SkipGraphValidation,
+		Config:                    config,
+		Changes:                   plan.Changes,
+		DeferredChanges:           plan.DeferredResources,
+		State:                     plan.PriorState,
+		RootVariableValues:        variables,
+		ExternalProviderConfigs:   opts.ExternalProviders,
+		Plugins:                   c.plugins,
+		Targets:                   plan.TargetAddrs,
+		ActionTargets:             plan.ActionTargetAddrs,
+		ForceReplace:              plan.ForceReplaceAddrs,
+		Operation:                 operation,
+		ExternalReferences:        plan.ExternalReferences,
+		Overrides:                 plan.Overrides,
+		SkipGraphValidation:       c.graphOpts.SkipGraphValidation,
+		AllowRootEphemeralOutputs: opts.AllowRootEphemeralOutputs,
+		PolicyClient:              opts.PolicyClient,
 	}).Build(addrs.RootModuleInstance)
 	diags = diags.Append(moreDiags)
 	if moreDiags.HasErrors() {

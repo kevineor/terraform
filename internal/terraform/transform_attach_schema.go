@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -42,6 +42,15 @@ type GraphNodeAttachProvisionerSchema interface {
 	AttachProvisionerSchema(name string, schema *configschema.Block)
 }
 
+// GraphNodeAttachActionSchema is an interface implemented by node types
+// that need a resource schema attached.
+type GraphNodeAttachActionSchema interface {
+	GraphNodeConfigAction
+	GraphNodeProviderConsumer
+
+	AttachActionSchema(schema *providers.ActionSchema)
+}
+
 // AttachSchemaTransformer finds nodes that implement
 // GraphNodeAttachResourceSchema, GraphNodeAttachProviderConfigSchema, or
 // GraphNodeAttachProvisionerSchema, looks up the needed schemas for each
@@ -64,7 +73,7 @@ func (t *AttachSchemaTransformer) Transform(g *Graph) error {
 			addr := tv.ResourceAddr()
 			mode := addr.Resource.Mode
 			typeName := addr.Resource.Type
-			providerFqn := tv.Provider()
+			providerFqn := tv.Provider().FQN()
 
 			schema, err := t.Plugins.ResourceTypeSchema(providerFqn, mode, typeName)
 			if err != nil {
@@ -106,6 +115,21 @@ func (t *AttachSchemaTransformer) Transform(g *Graph) error {
 				log.Printf("[TRACE] AttachSchemaTransformer: attaching provisioner %q config schema to %s", name, dag.VertexName(v))
 				tv.AttachProvisionerSchema(name, schema)
 			}
+		}
+
+		if tv, ok := v.(GraphNodeAttachActionSchema); ok {
+			addr := tv.ActionAddr()
+			providerFqn := tv.Provider().FQN()
+			schema, err := t.Plugins.ActionTypeSchema(providerFqn, addr.Action.Type)
+			if err != nil {
+				return fmt.Errorf("failed to read schema for %s in %s: %s", addr, providerFqn, err)
+			}
+			if schema.ConfigSchema == nil {
+				log.Printf("[ERROR] AttachSchemaTransformer: No action schema available for %s", addr)
+				continue
+			}
+			log.Printf("[TRACE] AttachSchemaTransformer: attaching action schema to %s", dag.VertexName(v))
+			tv.AttachActionSchema(schema)
 		}
 	}
 

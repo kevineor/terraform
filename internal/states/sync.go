@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package states
@@ -139,6 +139,19 @@ func (s *SyncState) ResourceInstance(addr addrs.AbsResourceInstance) *ResourceIn
 	s.lock.RLock()
 	ret := s.state.ResourceInstance(addr).DeepCopy()
 	s.lock.RUnlock()
+	return ret
+}
+
+func (s *SyncState) ResourceInstancesByConfig(addr addrs.ConfigResource) []*ResourceInstance {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	addrs := s.state.allResourceInstanceObjectAddrs(func(objAddr addrs.AbsResourceInstanceObject) bool {
+		return objAddr.ResourceInstance.ConfigResource().Equal(addr)
+	})
+	ret := make([]*ResourceInstance, 0, len(addrs))
+	for _, addr := range addrs {
+		ret = append(ret, s.state.ResourceInstance(addr.ResourceInstance).DeepCopy())
+	}
 	return ret
 }
 

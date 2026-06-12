@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -99,12 +99,12 @@ func testDisco(s *httptest.Server) *disco.Disco {
 	host, _ := url.Parse(s.URL)
 	defaultHostname := "app.terraform.io"
 	tfeHost := svchost.Hostname(defaultHostname)
-	services := map[string]interface{}{
+	services := map[string]any{
 		"cloudplugin.v1": fmt.Sprintf("%s/api/cloudplugin/v1/", s.URL),
 		"tfe.v2":         fmt.Sprintf("%s/api/v2/", s.URL),
 	}
 
-	credsSrc := auth.StaticCredentialsSource(map[svchost.Hostname]map[string]interface{}{
+	credsSrc := auth.StaticCredentialsSource(map[svchost.Hostname]map[string]any{
 		tfeHost: {"token": "test-auth-token"},
 	})
 
@@ -123,7 +123,7 @@ func TestCloud_withBackendConfig(t *testing.T) {
 	disco := testDisco(server)
 
 	wd := tempWorkingDirFixture(t, "cloud-config")
-	defer testChdir(t, wd.RootModuleDir())()
+	t.Chdir(wd.RootModuleDir())
 
 	// Overwrite the cloud backend with the test disco
 	previousBackend := backendInit.Backend("cloud")
@@ -135,7 +135,7 @@ func TestCloud_withBackendConfig(t *testing.T) {
 
 	// Initialize the backend
 	ic := &InitCommand{
-		Meta{
+		Meta: Meta{
 			Ui:               ui,
 			View:             view,
 			testingOverrides: metaOverridesForProvider(testProvider()),
@@ -178,7 +178,7 @@ func TestCloud_withENVConfig(t *testing.T) {
 	disco := testDisco(server)
 
 	wd := tempWorkingDir(t)
-	defer testChdir(t, wd.RootModuleDir())()
+	t.Chdir(wd.RootModuleDir())
 
 	serverURL, _ := url.Parse(server.URL)
 

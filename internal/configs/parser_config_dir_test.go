@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package configs
@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/terraform/internal/addrs"
 )
 
 // TestParseLoadConfigDirSuccess is a simple test that just verifies that
@@ -34,6 +37,14 @@ func TestParserLoadConfigDirSuccess(t *testing.T) {
 		name := info.Name()
 		t.Run(name, func(t *testing.T) {
 			parser := NewParser(nil)
+
+			if strings.Contains(name, "state-store") {
+				// The PSS project is currently gated as experimental
+				// TODO(SarahFrench/radeksimko) - remove this from the test once
+				// the feature is GA.
+				parser.allowExperiments = true
+			}
+
 			path := filepath.Join("testdata/valid-modules", name)
 
 			mod, diags := parser.LoadConfigDir(path)
@@ -111,12 +122,13 @@ func TestParserLoadConfigDirSuccess(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestParserLoadConfigDirWithTests(t *testing.T) {
 	directories := []string{
 		"testdata/valid-modules/with-tests",
+		"testdata/valid-modules/with-tests-backend",
+		"testdata/valid-modules/with-tests-same-backend-across-files",
 		"testdata/valid-modules/with-tests-expect-failures",
 		"testdata/valid-modules/with-tests-nested",
 		"testdata/valid-modules/with-tests-very-nested",
@@ -126,14 +138,14 @@ func TestParserLoadConfigDirWithTests(t *testing.T) {
 
 	for _, directory := range directories {
 		t.Run(directory, func(t *testing.T) {
-
 			testDirectory := DefaultTestDirectory
 			if directory == "testdata/valid-modules/with-tests-very-nested" {
 				testDirectory = "very/nested"
 			}
 
 			parser := NewParser(nil)
-			mod, diags := parser.LoadConfigDirWithTests(directory, testDirectory)
+			parser.AllowLanguageExperiments(true)
+			mod, diags := parser.LoadConfigDir(directory, MatchTestFiles(testDirectory))
 			if len(diags) > 0 { // We don't want any warnings or errors.
 				t.Errorf("unexpected diagnostics")
 				for _, diag := range diags {
@@ -148,8 +160,290 @@ func TestParserLoadConfigDirWithTests(t *testing.T) {
 	}
 }
 
-func TestParserLoadTestFiles_Invalid(t *testing.T) {
+func TestParserLoadConfigDirWithQueries(t *testing.T) {
+	tests := []struct {
+		name             string
+		directory        string
+		diagnostics      []string
+		listResources    int
+		managedResources int
+	}{
+		{
+			name:          "simple",
+			directory:     "testdata/query-files/valid/simple",
+			listResources: 3,
+		},
+		{
+			name:             "mixed",
+			directory:        "testdata/query-files/valid/mixed",
+			listResources:    3,
+			managedResources: 1,
+		},
+		{
+			name:             "loading query lists with no-experiments",
+			directory:        "testdata/query-files/valid/mixed",
+			managedResources: 1,
+			listResources:    3,
+		},
+		{
+			name:      "no-provider",
+			directory: "testdata/query-files/invalid/no-provider",
+			diagnostics: []string{
+				"testdata/query-files/invalid/no-provider/main.tfquery.hcl:1,1-27: Missing \"provider\" attribute; You must specify a provider attribute when defining a list block.",
+			},
+		},
+		{
+			name:      "with-depends-on",
+			directory: "testdata/query-files/invalid/with-depends-on",
+			diagnostics: []string{
+				"testdata/query-files/invalid/with-depends-on/main.tfquery.hcl:23,3-13: Unsupported argument; An argument named \"depends_on\" is not expected here.",
+			},
+			listResources: 2,
+		},
+	}
 
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parser := NewParser(nil)
+			mod, diags := parser.LoadConfigDir(test.directory, MatchQueryFiles())
+			if len(test.diagnostics) > 0 {
+				if !diags.HasErrors() {
+					t.Errorf("expected errors, but found none")
+				}
+				if len(diags) != len(test.diagnostics) {
+					t.Fatalf("expected %d errors, but found %d", len(test.diagnostics), len(diags))
+				}
+				for i, diag := range diags {
+					if diag.Error() != test.diagnostics[i] {
+						t.Errorf("expected error to be %q, but found %q", test.diagnostics[i], diag.Error())
+					}
+				}
+			} else {
+				if len(diags) > 0 { // We don't want any warnings or errors.
+					t.Errorf("unexpected diagnostics")
+					for _, diag := range diags {
+						t.Logf("- %s", diag)
+					}
+				}
+			}
+
+			if len(mod.ListResources) != test.listResources {
+				t.Errorf("incorrect number of list blocks found: %d", len(mod.ListResources))
+			}
+
+			if len(mod.ManagedResources) != test.managedResources {
+				t.Errorf("incorrect number of managed blocks found: %d", len(mod.ManagedResources))
+			}
+		})
+	}
+}
+
+// Testing happy path use of 'from { backend }'.
+func TestParserLoadConfigDirWithStateMigrations_from_backend(t *testing.T) {
+	testFixtures := "testdata/state-migration-files/valid/migration-from-backend"
+	// Below are specified in the config above
+	backendType := "s3"
+	bucketName := "foobar"
+
+	// Parse the directory, including .tfmigrate.hcl files
+	parser := NewParser(nil)
+	mod, diags := parser.LoadConfigDir(testFixtures, MatchStateMigrateFiles())
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if mod.StateMigrationInstructions == nil || mod.StateMigrationInstructions.Backend == nil {
+		t.Fatalf("expected mod.StateMigrationInstructions.MigrateFromBackend to be initialized, got:\n mod.StateMigrationInstructions = %#v\n mod.StateMigrationInstructions.MigrateFromBackend = %#v",
+			mod.StateMigrationInstructions,
+			mod.StateMigrationInstructions.Backend,
+		)
+	}
+
+	// Assert that the module includes expected information from 'from { backend }' block
+	b := mod.StateMigrationInstructions.Backend
+	if b.Type != backendType {
+		t.Fatalf("wrong backend type, got %q, want %q", b.Type, backendType)
+	}
+	attributes, diags := b.Config.JustAttributes()
+	if diags.HasErrors() {
+		t.Fatalf("unexpected error inspecting backend config: %s", diags)
+	}
+	gotBucketName, diags := attributes["bucket"].Expr.Value(nil)
+	if diags.HasErrors() {
+		t.Fatalf("unexpected error inspecting bucket attribute: %s", diags)
+	}
+	if gotBucketName.AsString() != bucketName {
+		t.Fatalf("wrong bucket name, got %q, want %q", gotBucketName, bucketName)
+	}
+}
+
+// Testing happy path use of 'from { state_store }'. This requires use of the state_store_provider
+// block as well, so this also checks the happy path for that block.
+func TestParserLoadConfigDirWithStateMigrations_from_state_store(t *testing.T) {
+	testFixtures := "testdata/state-migration-files/valid/migration-from-state-store"
+	// Below are specified in the config above
+	stateStoreType := "test_store"
+
+	// Parse the directory, including .tfmigrate.hcl files
+	parser := NewParser(nil)
+	mod, diags := parser.LoadConfigDir(testFixtures, MatchStateMigrateFiles())
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if mod.StateMigrationInstructions == nil || mod.StateMigrationInstructions.StateStore == nil || mod.StateMigrationInstructions.StateStoreProvider == nil {
+		t.Fatalf("expected MigrateFromStateStore and StateStoreProvider to be initialized, got:\n mod.StateMigrationInstructions = %#v\n mod.StateMigrationInstructions.MigrateFromStateStore = %#v\n mod.StateMigrationInstructions.StateStoreProvider = %#v",
+			mod.StateMigrationInstructions,
+			mod.StateMigrationInstructions.StateStore,
+			mod.StateMigrationInstructions.StateStoreProvider,
+		)
+	}
+
+	// Assert that the module includes expected information from 'from { state_store }' block
+	ss := mod.StateMigrationInstructions.StateStore
+	if ss.Type != stateStoreType {
+		t.Fatalf("wrong state store type, got %q, want %q", ss.Type, stateStoreType)
+	}
+	if ss.Config == nil {
+		t.Fatalf("expected config to be non-nil")
+	}
+	if !ss.ProviderAddr.Equals(mod.StateMigrationInstructions.StateStoreProvider.Type) {
+		t.Fatalf("expected state store description's provider addr to have been populated with %q, but got %q", mod.StateMigrationInstructions.StateStoreProvider.Type.ForDisplay(), ss.ProviderAddr.ForDisplay())
+	}
+	if ss.ProviderSupplyMode != "" {
+		// This is expected to be populated by calling code
+		// that is reading the config, not by the parser itself.
+		t.Fatal("unexpected data in ProviderSupplyMode")
+	}
+
+	// Assert that the module includes expected information from state_store_provider block
+	ssp := mod.StateMigrationInstructions.StateStoreProvider
+	if ssp.Name != "test" || ssp.Source != "hashicorp/test" || !ssp.Type.Equals(addrs.NewDefaultProvider("test")) {
+		t.Fatalf("unexpected state store provider info, got:\n Name: %q\n Source: %q\n Type: %q\n VersionConstraint: %q",
+			ssp.Name, ssp.Source, ssp.Type, ssp.Requirement,
+		)
+	}
+	expectedConstraint := "1.0.0"
+	if ssp.Requirement.Required.String() != expectedConstraint {
+		t.Fatalf("unexpected version constraint, got %q, want %q", ssp.Requirement.Required.String(), expectedConstraint)
+	}
+}
+
+func TestParserLoadConfigDirWithStateMigrations_error_cases(t *testing.T) {
+	tests := []struct {
+		name              string
+		directory         string
+		diagnosticSummary string
+		source            string
+	}{
+		// Duplicated blocks
+		{
+			name:              "duplicated 'from' block",
+			directory:         "testdata/state-migration-files/invalid/duplicate-from-block-same-file",
+			diagnosticSummary: "Duplicate \"from\" configuration block",
+			// Assert the source because we reference the second parsed 'from' block
+			source: "1-file.tfmigrate.hcl:17,1-5",
+		},
+		{
+			name:              "duplicated 'from' block across multiple files",
+			directory:         "testdata/state-migration-files/invalid/duplicate-from-block-multiple-files",
+			diagnosticSummary: "Duplicate \"from\" configuration block",
+			// Assert the source because we reference the 'from' block in the second parsed file
+			source: "2-file.tfmigrate.hcl:1,1-5",
+		},
+		{
+			name:              "duplicate 'backend' block in 'from' block",
+			directory:         "testdata/state-migration-files/invalid/duplicate-nested-backend-block",
+			diagnosticSummary: "Duplicate \"backend\" configuration block",
+		},
+		{
+			name:              "duplicate 'state_store' block in 'from' block",
+			directory:         "testdata/state-migration-files/invalid/duplicate-nested-state-store-block",
+			diagnosticSummary: "Duplicate \"state_store\" configuration block",
+		},
+		// Mutually exclusive blocks
+		{
+			name:              "backend and state_store are mutually exclusive in same 'from' block",
+			directory:         "testdata/state-migration-files/invalid/both-nested-state-store-and-backend-blocks",
+			diagnosticSummary: `Invalid combination of "backend" and "state_store"`,
+			// Assert the source because we reference the 'from' block as incorrect, instead of one of the nested blocks
+			source: "main.tfmigrate.hcl:4,1-5",
+		},
+		{
+			name:              "backend and state_store_provider are mutually exclusive",
+			directory:         "testdata/state-migration-files/invalid/backend-and-state-store-provider-same-file",
+			diagnosticSummary: `Invalid combination of "backend" and "state_store_provider"`,
+		},
+		{
+			name:              "backend and state_store_provider are mutually exclusive across multiple files",
+			directory:         "testdata/state-migration-files/invalid/backend-and-state-store-provider-multiple-files",
+			diagnosticSummary: `Invalid combination of "backend" and "state_store_provider"`,
+		},
+		// Missing blocks
+		{
+			name:              "only state_store_provider block, missing state_store",
+			directory:         "testdata/state-migration-files/invalid/only-state-store-provider-block",
+			diagnosticSummary: `Missing "state_store" block for state store migration`,
+		},
+		{
+			name:              "only state_store block, missing state_store_provider",
+			directory:         "testdata/state-migration-files/invalid/only-state-store-block",
+			diagnosticSummary: `Missing "state_store_provider" block for state store migration`,
+		},
+		{
+			name:              "no blocks present in the files",
+			directory:         "testdata/state-migration-files/invalid/no-blocks",
+			diagnosticSummary: `Empty state migration configuration`,
+		},
+		// Invalid contents of state_store_provider block
+		{
+			name:              "invalid version constraint in state_store_provider block",
+			directory:         "testdata/state-migration-files/invalid/invalid-version-state-store-provider-block",
+			diagnosticSummary: `Invalid provider version in "state_store_provider" configuration block`,
+		},
+		{
+			name:              "unexpected attribute in state_store_provider block",
+			directory:         "testdata/state-migration-files/invalid/unexpected-attribute-state-store-provider-block",
+			diagnosticSummary: `Invalid state_store_provider object; state_store_provider objects can only contain "version" and "source" attributes.`,
+		},
+		{
+			name:              "different providers in migrate_from_state_store and state_store_provider blocks",
+			directory:         "testdata/state-migration-files/invalid/different-providers-between-blocks",
+			diagnosticSummary: `Inconsistent provider information for state migration`,
+		},
+		{
+			name:              "multiple providers described in a state_store_provider block",
+			directory:         "testdata/state-migration-files/invalid/multiple-providers-in-state-store-provider-block",
+			diagnosticSummary: `Unexpected number of providers described in "state_store_provider" configuration block.`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parser := NewParser(nil)
+			_, diags := parser.LoadConfigDir(test.directory, MatchStateMigrateFiles())
+			if !diags.HasErrors() {
+				t.Fatalf("expected errors but got none: %s", diags)
+			}
+			if len(diags) != 1 {
+				for _, diag := range diags {
+					t.Log(diag)
+				}
+				t.Fatalf("expected only a single diagnostic to be returned, but got %d: \n%#v", len(diags), diags)
+			}
+			if !strings.Contains(diags.Error(), test.diagnosticSummary) {
+				t.Fatalf("expected error to contain %q, but got %q", test.diagnosticSummary, diags.Error())
+			}
+			if test.source != "" {
+				// We're only asserting source content in cases where the fromBlockSource value is used.
+				expectedSource := path.Join(test.directory, test.source)
+				if diags[0].Subject.String() != expectedSource {
+					t.Fatalf("expected error subject to be %q, but got %q", expectedSource, diags[0].Subject.String())
+				}
+			}
+		})
+	}
+}
+
+func TestParserLoadTestFiles_Invalid(t *testing.T) {
 	tcs := map[string][]string{
 		"duplicate_data_overrides": {
 			"duplicate_data_overrides.tftest.hcl:7,3-16: Duplicate override_data block; An override_data block targeting data.aws_instance.test has already been defined at duplicate_data_overrides.tftest.hcl:2,3-16.",
@@ -190,12 +484,6 @@ func TestParserLoadTestFiles_Invalid(t *testing.T) {
 			"invalid_data_override_target.tftest.hcl:8,3-24: Invalid override target; You can only target data sources from override_data blocks, not module.child.",
 			"invalid_data_override_target.tftest.hcl:3,3-31: Invalid override target; You can only target data sources from override_data blocks, not aws_instance.target.",
 		},
-		"invalid_mock_data_sources": {
-			"invalid_mock_data_sources.tftest.hcl:7,13-16: Variables not allowed; Variables may not be used here.",
-		},
-		"invalid_mock_resources": {
-			"invalid_mock_resources.tftest.hcl:7,13-16: Variables not allowed; Variables may not be used here.",
-		},
 		"invalid_module_override": {
 			"invalid_module_override.tftest.hcl:5,1-16: Missing target attribute; override_module blocks must specify a target address.",
 			"invalid_module_override.tftest.hcl:11,3-9: Unsupported argument; An argument named \"values\" is not expected here.",
@@ -215,6 +503,24 @@ func TestParserLoadTestFiles_Invalid(t *testing.T) {
 			"duplicate_file_config.tftest.hcl:3,1-5: Multiple \"test\" blocks; This test file already has a \"test\" block defined at duplicate_file_config.tftest.hcl:1,1-5.",
 			"duplicate_file_config.tftest.hcl:5,1-5: Multiple \"test\" blocks; This test file already has a \"test\" block defined at duplicate_file_config.tftest.hcl:1,1-5.",
 		},
+		"duplicate_backend_blocks_in_test": {
+			"duplicate_backend_blocks_in_test.tftest.hcl:15,3-18: Duplicate backend blocks; The run \"test\" already uses an internal state file that's loaded by a backend in the run \"setup\". Please ensure that a backend block is only in the first apply run block for a given internal state file.",
+		},
+		"duplicate_backend_blocks_in_run": {
+			"duplicate_backend_blocks_in_run.tftest.hcl:6,3-18: Duplicate backend blocks; A backend block has already been defined inside the run \"setup\" at duplicate_backend_blocks_in_run.tftest.hcl:3,3-18.",
+		},
+		"backend_block_in_plan_run": {
+			"backend_block_in_plan_run.tftest.hcl:6,3-18: Invalid backend block; A backend block can only be used in the first apply run block for a given internal state file. It cannot be included in a block to run a plan command.",
+		},
+		"backend_block_in_second_apply_run": {
+			"backend_block_in_second_apply_run.tftest.hcl:10,3-18: Invalid backend block; The run \"test_2\" cannot load in state using a backend block, because internal state has already been created by an apply command in run \"test_1\". Backend blocks can only be present in the first apply command for a given internal state.",
+		},
+		"non_state_storage_backend_in_test": {
+			"non_state_storage_backend_in_test.tftest.hcl:4,3-19: Invalid backend block; The \"remote\" backend type cannot be used in the backend block in run \"test\" at non_state_storage_backend_in_test.tftest.hcl:4,3-19. Only state storage backends can be used in a test run.",
+		},
+		"skip_cleanup_after_backend": {
+			"skip_cleanup_after_backend.tftest.hcl:13,3-15: Duplicate \"skip_cleanup\" block; The run \"skip_cleanup\" has a skip_cleanup attribute set, but shares state with an earlier run \"backend\" that has a backend defined. The later run takes precedence, but the backend will still be used to manage this state.",
+		},
 	}
 
 	for name, expected := range tcs {
@@ -227,6 +533,7 @@ func TestParserLoadTestFiles_Invalid(t *testing.T) {
 			parser := testParser(map[string]string{
 				fmt.Sprintf("%s.tftest.hcl", name): string(src),
 			})
+			parser.AllowLanguageExperiments(true)
 
 			_, actual := parser.LoadTestFile(fmt.Sprintf("%s.tftest.hcl", name))
 			assertExactDiagnostics(t, actual, expected)
@@ -248,7 +555,7 @@ func TestParserLoadConfigDirWithTests_ReturnsWarnings(t *testing.T) {
 			t.Errorf("expected summary to be \"Test directory does not exist\" but was \"%s\"", diags[0].Summary)
 		}
 
-		if diags[0].Detail != "Requested test directory testdata/valid-modules/with-tests/not_real does not exist." {
+		if !strings.HasPrefix(diags[0].Detail, "Requested test directory testdata/valid-modules/with-tests/not_real does not exist.") {
 			t.Errorf("expected detail to be \"Requested test directory testdata/valid-modules/with-tests/not_real does not exist.\" but was \"%s\"", diags[0].Detail)
 		}
 	}
@@ -283,7 +590,7 @@ func TestParserLoadConfigDirFailure(t *testing.T) {
 			parser := NewParser(nil)
 			path := filepath.Join("testdata/invalid-modules", name)
 
-			_, diags := parser.LoadConfigDirWithTests(path, "tests")
+			_, diags := parser.LoadConfigDir(path, MatchTestFiles("tests"))
 			if !diags.HasErrors() {
 				t.Errorf("no errors; want at least one")
 				for _, diag := range diags {
@@ -321,7 +628,6 @@ func TestParserLoadConfigDirFailure(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestIsEmptyDir(t *testing.T) {

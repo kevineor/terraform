@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package views
@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform/internal/command/jsonprovider"
 	"github.com/hashicorp/terraform/internal/command/views/json"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/states/statefile"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -34,6 +35,8 @@ type Operation interface {
 	PlanNextStep(planPath string, genConfigPath string)
 
 	Diagnostics(diags tfdiags.Diagnostics)
+
+	PolicyResults(results *plans.PolicyResults, setupDiags policy.Diagnostics)
 }
 
 func NewOperation(vt arguments.ViewType, inAutomation bool, view *View) Operation {
@@ -92,7 +95,7 @@ func (v *OperationHuman) EmergencyDumpState(stateFile *statefile.File) error {
 }
 
 func (v *OperationHuman) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
-	outputs, changed, drift, attrs, err := jsonplan.MarshalForRenderer(plan, schemas)
+	outputs, changed, drift, attrs, actions, err := jsonplan.MarshalForRenderer(plan, schemas)
 	if err != nil {
 		v.view.streams.Eprintf("Failed to marshal plan to json: %s", err)
 		return
@@ -112,6 +115,7 @@ func (v *OperationHuman) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 		ResourceDrift:         drift,
 		ProviderSchemas:       jsonprovider.MarshalForRenderer(schemas),
 		RelevantAttributes:    attrs,
+		ActionInvocations:     actions,
 	}
 
 	// Side load some data that we can't extract from the JSON plan.
@@ -128,6 +132,10 @@ func (v *OperationHuman) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 	}
 
 	renderer.RenderHumanPlan(jplan, plan.UIMode, opts...)
+}
+
+func (v *OperationHuman) PolicyResults(results *plans.PolicyResults, setupDiags policy.Diagnostics) {
+	v.view.PolicyResults(results, setupDiags)
 }
 
 func (v *OperationHuman) PlannedChange(change *plans.ResourceInstanceChangeSrc) {
@@ -253,6 +261,10 @@ func (v *OperationJSON) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 			v.view.PlannedChange(json.NewResourceInstanceChange(change))
 		}
 	}
+	cs.ActionInvocation = len(plan.Changes.ActionInvocations)
+	for _, action := range plan.Changes.ActionInvocations {
+		v.view.PlannedActionInvocation(json.NewPlannedActionInvocation(action))
+	}
 
 	v.view.ChangeSummary(cs)
 
@@ -283,6 +295,10 @@ func (v *OperationJSON) PlanNextStep(planPath string, genConfigPath string) {
 
 func (v *OperationJSON) Diagnostics(diags tfdiags.Diagnostics) {
 	v.view.Diagnostics(diags)
+}
+
+func (v *OperationJSON) PolicyResults(results *plans.PolicyResults, setupDiags policy.Diagnostics) {
+	v.view.PolicyResults(results, setupDiags)
 }
 
 const fatalInterrupt = `

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -11,8 +11,14 @@ import (
 
 	"github.com/hashicorp/cli"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/backend"
+	backendInit "github.com/hashicorp/terraform/internal/backend/init"
+	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
+	"github.com/hashicorp/terraform/internal/states/statefile"
 )
 
 func TestStateReplaceProvider(t *testing.T) {
@@ -223,7 +229,7 @@ func TestStateReplaceProvider(t *testing.T) {
 			t.Fatalf("successful exit; want error")
 		}
 
-		if got, want := ui.ErrorWriter.String(), "Error parsing command-line flags"; !strings.Contains(got, want) {
+		if got, want := ui.ErrorWriter.String(), "Failed to parse command-line flags"; !strings.Contains(got, want) {
 			t.Fatalf("missing expected error message\nwant: %s\nfull output:\n%s", want, got)
 		}
 	})
@@ -285,6 +291,216 @@ func TestStateReplaceProvider(t *testing.T) {
 	})
 }
 
+func TestStateReplaceProvider_stateStore(t *testing.T) {
+	// Create a temporary working directory
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("state-store-unchanged"), td)
+	t.Chdir(td)
+
+	// Get bytes describing a state containing resources
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(
+			addrs.Resource{
+				Mode: addrs.ManagedResourceMode,
+				Type: "test_instance",
+				Name: "foo",
+			}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+			&states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"id":"foo","foo":"value","bar":"value"}`),
+				Status:    states.ObjectReady,
+			},
+			addrs.AbsProviderConfig{
+				Provider: addrs.NewDefaultProvider("test"),
+				Module:   addrs.RootModule,
+			},
+		)
+		s.SetResourceInstanceCurrent(
+			addrs.Resource{
+				Mode: addrs.ManagedResourceMode,
+				Type: "test_instance",
+				Name: "baz",
+			}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+			&states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"id":"baz","foo":"value","bar":"value"}`),
+				Status:    states.ObjectReady,
+			},
+			addrs.AbsProviderConfig{
+				Provider: addrs.NewDefaultProvider("test"),
+				Module:   addrs.RootModule,
+			},
+		)
+	})
+	var stateBuf bytes.Buffer
+	if err := statefile.Write(statefile.New(state, "", 1), &stateBuf); err != nil {
+		t.Fatalf("error during test setup: %s", err)
+	}
+
+	// Create a mock that contains a persisted "default" state that uses the bytes from above.
+	mockProvider := mockPluggableStateStorageProvider()
+	mockProvider.MockStates = map[string]interface{}{
+		"default": stateBuf.Bytes(),
+	}
+	mockProviderAddress := addrs.NewDefaultProvider("test")
+
+	ui := new(cli.MockUi)
+	c := &StateReplaceProviderCommand{
+		StateMeta{
+			Meta: Meta{
+				AllowExperimentalFeatures: true,
+				testingOverrides: &testingOverrides{
+					Providers: map[addrs.Provider]providers.Factory{
+						mockProviderAddress: providers.FactoryFixed(mockProvider),
+					},
+				},
+				Ui: ui,
+			},
+		},
+	}
+
+	inputBuf := &bytes.Buffer{}
+	ui.InputReader = inputBuf
+	inputBuf.WriteString("yes\n")
+
+	args := []string{
+		"hashicorp/test",
+		"testing-corp/test",
+	}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("return code: %d\n\n%s", code, ui.ErrorWriter.String())
+	}
+
+	// For the two resources in the mocked state, we expect them both to be changed.
+	expectedOutputMsgs := []string{
+		"- registry.terraform.io/hashicorp/test\n    + registry.terraform.io/testing-corp/test\n",
+		"Successfully replaced provider for 2 resources.",
+	}
+	for _, msg := range expectedOutputMsgs {
+		if !strings.Contains(ui.OutputWriter.String(), msg) {
+			t.Fatalf("expected command output to include %q but it's not present in the output:\nOutput = %s",
+				msg, ui.OutputWriter.String())
+		}
+	}
+}
+
+func TestStateReplaceProvider_constVariable(t *testing.T) {
+	t.Run("missing value", func(t *testing.T) {
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var")
+		t.Chdir(wd.RootModuleDir())
+
+		ui := cli.NewMockUi()
+		view, _ := testView(t)
+		c := &StateReplaceProviderCommand{
+			StateMeta{
+				Meta: Meta{
+					testingOverrides: metaOverridesForProvider(testProvider()),
+					Ui:               ui,
+					View:             view,
+					WorkingDir:       wd,
+				},
+			},
+		}
+
+		args := []string{
+			"-auto-approve",
+			"hashicorp/test",
+			"testing-corp/test",
+		}
+		if code := c.Run(args); code == 0 {
+			t.Fatalf("expected error, got 0")
+		}
+
+		errStr := ui.ErrorWriter.String()
+		if !strings.Contains(errStr, "No value for required variable") {
+			t.Fatalf("expected missing variable error, got: %s", errStr)
+		}
+	})
+
+	t.Run("value via cli", func(t *testing.T) {
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var")
+		t.Chdir(wd.RootModuleDir())
+
+		ui := cli.NewMockUi()
+		view, _ := testView(t)
+		c := &StateReplaceProviderCommand{
+			StateMeta{
+				Meta: Meta{
+					testingOverrides: metaOverridesForProvider(testProvider()),
+					Ui:               ui,
+					View:             view,
+					WorkingDir:       wd,
+				},
+			},
+		}
+
+		args := []string{
+			"-auto-approve",
+			"-var", "module_name=child",
+			"hashicorp/test",
+			"testing-corp/test",
+		}
+		if code := c.Run(args); code != 0 {
+			t.Fatalf("return code: %d\n\n%s", code, ui.ErrorWriter.String())
+		}
+
+		actual := strings.TrimSpace(testStateRead(t, "terraform.tfstate").String())
+		expected := strings.TrimSpace(`
+<no state>
+module.child:
+  test_instance.test:
+    ID = 
+    provider = provider["registry.terraform.io/testing-corp/test"]
+`)
+		if diff := cmp.Diff(expected, actual); diff != "" {
+			t.Fatalf("unexpected state output\n%s", diff)
+		}
+	})
+
+	t.Run("value via backend", func(t *testing.T) {
+		mockBackend := TestNewVariableBackend(map[string]string{
+			"module_name": "child",
+		})
+		backendInit.Set("local-vars", func() backend.Backend { return mockBackend })
+		defer backendInit.Set("local-vars", nil)
+
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var-backend")
+		t.Chdir(wd.RootModuleDir())
+
+		ui := cli.NewMockUi()
+		view, _ := testView(t)
+		c := &StateReplaceProviderCommand{
+			StateMeta{
+				Meta: Meta{
+					testingOverrides: metaOverridesForProvider(testProvider()),
+					Ui:               ui,
+					View:             view,
+					WorkingDir:       wd,
+				},
+			},
+		}
+
+		args := []string{
+			"-auto-approve",
+			"hashicorp/test",
+			"testing-corp/test",
+		}
+		if code := c.Run(args); code != 0 {
+			t.Fatalf("return code: %d\n\n%s", code, ui.ErrorWriter.String())
+		}
+
+		actual := strings.TrimSpace(testStateRead(t, "terraform.tfstate").String())
+		expected := strings.TrimSpace(`
+<no state>
+module.child:
+  test_instance.test:
+    ID = 
+    provider = provider["registry.terraform.io/testing-corp/test"]
+`)
+		if diff := cmp.Diff(expected, actual); diff != "" {
+			t.Fatalf("unexpected state output\n%s", diff)
+		}
+	})
+}
+
 func TestStateReplaceProvider_docs(t *testing.T) {
 	c := &StateReplaceProviderCommand{}
 
@@ -301,7 +517,7 @@ func TestStateReplaceProvider_checkRequiredVersion(t *testing.T) {
 	// Create a temporary working directory that is empty
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath("command-check-required-version"), td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	state := states.BuildState(func(s *states.SyncState) {
 		s.SetResourceInstanceCurrent(

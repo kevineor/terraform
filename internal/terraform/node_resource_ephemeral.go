@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -76,6 +76,13 @@ func ephemeralResourceOpen(ctx EvalContext, inp ephemeralResourceInput) (*provid
 	if diags.HasErrors() {
 		return nil, diags
 	}
+	var deprecationDiags tfdiags.Diagnostics
+	configVal, deprecationDiags = ctx.Deprecations().ValidateAndUnmarkConfig(configVal, schema.Body, ctx.Path().Module())
+	diags = diags.Append(deprecationDiags.InConfigBody(config.Config, inp.addr.String()))
+	if diags.HasErrors() {
+		return nil, diags
+	}
+
 	unmarkedConfigVal, configMarks := configVal.UnmarkDeepWithPaths()
 
 	if !unmarkedConfigVal.IsWhollyKnown() {
@@ -230,11 +237,7 @@ func (n *nodeEphemeralResourceClose) Execute(ctx EvalContext, op walkOperation) 
 	return resources.CloseInstances(ctx.StopCtx(), n.addr)
 }
 
-func (n *nodeEphemeralResourceClose) ProvidedBy() (addrs.ProviderConfig, bool) {
-	return n.resourceNode.ProvidedBy()
-}
-
-func (n *nodeEphemeralResourceClose) Provider() addrs.Provider {
+func (n *nodeEphemeralResourceClose) Provider() ProviderRef {
 	return n.resourceNode.Provider()
 }
 

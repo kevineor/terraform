@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -970,6 +970,114 @@ import {
 			t.Errorf("got:\n%s\nwant:\n%s\ndiff:\n%s", got, want, diff)
 		}
 	})
+}
+
+// Generate configuration based on the provider's supplied config value
+func TestContext2Plan_importResourceProviderConfigGen(t *testing.T) {
+	addr := mustResourceInstanceAddr("test_object.a")
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+import {
+  to   = test_object.a
+  id   = "123"
+}
+`,
+	})
+
+	p := simpleMockProvider()
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
+		Provider: providers.Schema{Body: simpleTestSchema()},
+		ResourceTypes: map[string]providers.Schema{
+			"test_object": providers.Schema{Body: &configschema.Block{
+				Attributes: map[string]*configschema.Attribute{
+					// a real computed+optional id attribute, not like the SDK
+					"id": {
+						Type:     cty.String,
+						Computed: true,
+						Optional: true,
+					},
+					"is_default": {
+						Type:     cty.String,
+						Optional: true,
+						Computed: true,
+					},
+					"identifier": {
+						Type:     cty.Number,
+						Computed: true,
+					},
+					"required": {
+						Type:     cty.String,
+						Required: true,
+					},
+				},
+			}},
+		},
+		ServerCapabilities: providers.ServerCapabilities{
+			GenerateResourceConfig: true,
+		},
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+	p.GenerateResourceConfigResponse = &providers.GenerateResourceConfigResponse{
+		Config: cty.ObjectVal(map[string]cty.Value{
+			"id":         cty.StringVal("not_the_default"),
+			"is_default": cty.NullVal(cty.String),
+			"identifier": cty.NullVal(cty.String),
+			"required":   cty.StringVal("for_config"),
+		}),
+	}
+	p.ReadResourceResponse = &providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id":         cty.StringVal("not_the_default"),
+			"is_default": cty.StringVal("default"),
+			"identifier": cty.StringVal("123456789"),
+			"required":   cty.StringVal("for_config"),
+		}),
+	}
+	p.ImportResourceStateResponse = &providers.ImportResourceStateResponse{
+		ImportedResources: []providers.ImportedResource{
+			{
+				TypeName: "test_object",
+				State: cty.ObjectVal(map[string]cty.Value{
+					"id":         cty.NullVal(cty.String),
+					"identifier": cty.StringVal("123456789"),
+					"is_default": cty.NullVal(cty.String),
+					"required":   cty.NullVal(cty.String),
+				}),
+			},
+		},
+	}
+
+	diags := ctx.Validate(m, &ValidateOpts{})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	plan, diags := ctx.Plan(m, states.NewState(), &PlanOpts{
+		Mode:               plans.NormalMode,
+		GenerateConfigPath: "generated.tf", // Actual value here doesn't matter, as long as it is not empty.
+	})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	instPlan := plan.Changes.ResourceInstance(addr)
+	if instPlan == nil {
+		t.Fatalf("no plan for %s at all", addr)
+	}
+
+	want := `resource "test_object" "a" {
+  id       = "not_the_default"
+  required = "for_config"
+}`
+	got := instPlan.GeneratedConfig
+	if diff := cmp.Diff(want, got); len(diff) > 0 {
+		t.Errorf("got:\n%s\nwant:\n%s\ndiff:\n%s", got, want, diff)
+	}
 }
 
 func TestContext2Plan_importResourceConfigGenWithAlias(t *testing.T) {
@@ -2146,6 +2254,19 @@ func TestContext2Plan_importIdentityModuleWithOptional(t *testing.T) {
 	p := testProvider("aws")
 	m := testModule(t, "import-identity-module")
 
+	identitySchema := &configschema.Object{
+		Attributes: map[string]*configschema.Attribute{
+			"name": {
+				Type:     cty.String,
+				Required: true,
+			},
+			"something": {
+				Type:     cty.Number,
+				Optional: true,
+			},
+		},
+		Nesting: configschema.NestingSingle,
+	}
 	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&providerSchema{
 		ResourceTypes: map[string]*configschema.Block{
 			"aws_lb": {
@@ -2158,19 +2279,7 @@ func TestContext2Plan_importIdentityModuleWithOptional(t *testing.T) {
 			},
 		},
 		IdentityTypes: map[string]*configschema.Object{
-			"aws_lb": {
-				Attributes: map[string]*configschema.Attribute{
-					"name": {
-						Type:     cty.String,
-						Required: true,
-					},
-					"something": {
-						Type:     cty.Number,
-						Optional: true,
-					},
-				},
-				Nesting: configschema.NestingSingle,
-			},
+			"aws_lb": identitySchema,
 		},
 	})
 	wantIdentity := cty.ObjectVal(map[string]cty.Value{
@@ -2210,10 +2319,197 @@ func TestContext2Plan_importIdentityModuleWithOptional(t *testing.T) {
 		t.Fatalf("no plan for %s at all", addr)
 	}
 
-	identityMatches := instPlan.Importing.Identity.Equals(wantIdentity)
+	identity, err := instPlan.Importing.Identity.Decode(identitySchema.ImpliedType())
+	if err != nil {
+		t.Fatalf("failed to decode identity: %s", err)
+	}
+	identityMatches := identity.Equals(wantIdentity)
 	if !identityMatches.True() {
 		t.Errorf("identity does not match\ngot:  %s\nwant: %s",
-			tfdiags.ObjectToString(instPlan.Importing.Identity),
+			tfdiags.ObjectToString(identity),
 			tfdiags.ObjectToString(wantIdentity))
+	}
+}
+
+func TestContext2Plan_importIdentityMissingResponse(t *testing.T) {
+	p := testProvider("aws")
+	m := testModule(t, "import-identity-module")
+
+	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&providerSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"aws_lb": {
+				Attributes: map[string]*configschema.Attribute{
+					"id": {
+						Type:     cty.String,
+						Computed: true,
+					},
+				},
+			},
+		},
+		IdentityTypes: map[string]*configschema.Object{
+			"aws_lb": {
+				Attributes: map[string]*configschema.Attribute{
+					"name": {
+						Type:     cty.String,
+						Required: true,
+					},
+				},
+				Nesting: configschema.NestingSingle,
+			},
+		},
+	})
+	p.ImportResourceStateResponse = &providers.ImportResourceStateResponse{
+		ImportedResources: []providers.ImportedResource{
+			{
+				TypeName: "aws_lb",
+				State: cty.ObjectVal(map[string]cty.Value{
+					"id": cty.StringVal("foo"),
+				}),
+				// No identity returned
+			},
+		},
+	}
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("aws"): testProviderFuncFixed(p),
+		},
+	})
+
+	diags := ctx.Validate(m, &ValidateOpts{})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	_, diags = ctx.Plan(m, states.NewState(), DefaultPlanOpts)
+	if !diags.HasErrors() {
+		t.Fatal("succeeded; want errors")
+	}
+	if got, want := diags.Err().Error(), `import of aws_lb.foo didn't return an identity`; !strings.Contains(got, want) {
+		t.Fatalf("wrong error:\ngot:  %s\nwant: message containing %q", got, want)
+	}
+}
+
+func TestContext2Plan_importResourceConfigGenWithProviderLocalName(t *testing.T) {
+	addr := mustResourceInstanceAddr("test_object.a")
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+terraform {
+  required_providers {
+    random = {
+      source  = "hashicorp/test"
+    }
+  }
+}
+
+import {
+  provider = random
+  to       = test_object.a
+  id       = "123"
+}
+`,
+	})
+
+	p := simpleMockProvider()
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+	p.ReadResourceResponse = &providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"test_string": cty.StringVal("foo"),
+		}),
+	}
+	p.ImportResourceStateResponse = &providers.ImportResourceStateResponse{
+		ImportedResources: []providers.ImportedResource{
+			{
+				TypeName: "test_object",
+				State: cty.ObjectVal(map[string]cty.Value{
+					"test_string": cty.StringVal("foo"),
+				}),
+			},
+		},
+	}
+
+	diags := ctx.Validate(m, &ValidateOpts{})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	plan, diags := ctx.Plan(m, states.NewState(), &PlanOpts{
+		Mode:               plans.NormalMode,
+		GenerateConfigPath: "generated.tf", // Actual value here doesn't matter, as long as it is not empty.
+	})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	t.Run(addr.String(), func(t *testing.T) {
+		instPlan := plan.Changes.ResourceInstance(addr)
+		if instPlan == nil {
+			t.Fatalf("no plan for %s at all", addr)
+		}
+		// it's the same config as the test above, so we'll skip checking anything except the provider local name
+		want := `resource "test_object" "a" {
+  provider    = random
+  test_bool   = null
+  test_list   = null
+  test_map    = null
+  test_number = null
+  test_string = "foo"
+}`
+		got := instPlan.GeneratedConfig
+		if diff := cmp.Diff(want, got); len(diff) > 0 {
+			t.Errorf("got:\n%s\nwant:\n%s\ndiff:\n%s", got, want, diff)
+		}
+	})
+}
+
+func TestContext2Plan_importDeferredResource(t *testing.T) {
+	addr := mustResourceInstanceAddr("test_object.a")
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+import {
+  to   = test_object.a
+  id   = "123"
+}
+
+resource "test_object" "a" {}
+`,
+	})
+
+	p := simpleMockProvider()
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+	p.ImportResourceStateResponse = &providers.ImportResourceStateResponse{
+		Deferred: &providers.Deferred{
+			Reason: providers.DeferredReasonProviderConfigUnknown, // a made up problem for the test
+		},
+	}
+
+	diags := ctx.Validate(m, &ValidateOpts{})
+	tfdiags.AssertNoDiagnostics(t, diags)
+
+	plan, diags := ctx.Plan(m, states.NewState(), &PlanOpts{
+		Mode:               plans.NormalMode,
+		DeferralAllowed:    true,
+		GenerateConfigPath: "generated.tf", // Actual value here doesn't matter, as long as it is not empty.
+	})
+	tfdiags.AssertNoDiagnostics(t, diags)
+
+	instPlan := plan.Changes.ResourceInstance(addr)
+	if instPlan != nil {
+		t.Fatal("unexpected changes for the resource that should have been deferred")
+	}
+
+	if len(plan.DeferredResources) != 1 {
+		t.Fatalf("wrong number of deferred resources, wanted 1, got %d\n", len(plan.DeferredResources))
+	}
+
+	if plan.DeferredResources[0].ChangeSrc.Addr.String() != addr.String() {
+		t.Fatal("Wrong, but impressive - how did you even defer the wrong resource?")
 	}
 }

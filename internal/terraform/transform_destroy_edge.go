@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -13,12 +13,20 @@ import (
 
 // GraphNodeDestroyer must be implemented by nodes that destroy resources.
 type GraphNodeDestroyer interface {
-	dag.Vertex
-
 	// DestroyAddr is the address of the resource that is being
 	// destroyed by this node. If this returns nil, then this node
 	// is not destroying anything.
 	DestroyAddr() *addrs.AbsResourceInstance
+}
+
+// GraphNodePlanDestroyer is implemented only by the planning counterpart for
+// the destroy nodes. These are typically created for objects which only exist
+// in state, like orphaned instances or planing a full destroy operation.
+type GraphNodePlanDestroyer interface {
+	// DestroyAddr is the address of the resource that is being
+	// destroyed by this node. If this returns nil, then this node
+	// is not destroying anything.
+	PlanDestroyAddr() *addrs.AbsResourceInstance
 }
 
 // GraphNodeCreator must be implemented by nodes that create OR update resources.
@@ -99,19 +107,7 @@ func (t *DestroyEdgeTransformer) tryInterProviderDestroyEdge(g *Graph, from, to 
 	// description of the provider being used to help determine if 2 nodes are
 	// from the same provider instance.
 	getComparableProvider := func(pc GraphNodeProviderConsumer) string {
-		ps := pc.Provider().String()
-
-		// we don't care about `exact` here, since we're only looking for any
-		// clue that the providers may differ.
-		p, _ := pc.ProvidedBy()
-		switch p := p.(type) {
-		case addrs.AbsProviderConfig:
-			ps = p.String()
-		case addrs.LocalProviderConfig:
-			ps = p.String()
-		}
-
-		return ps
+		return pc.Provider().String()
 	}
 
 	pc, ok := from.(GraphNodeProviderConsumer)

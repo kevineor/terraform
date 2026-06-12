@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -91,6 +91,7 @@ func (t *ModuleExpansionTransformer) transform(g *Graph, c *configs.Config, pare
 		Addr:       c.Path,
 		Config:     c.Module,
 		ModuleCall: modCall,
+		ModuleTree: c,
 	}
 	var expander dag.Vertex = n
 	if t.Concrete != nil {

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform/internal/instances"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
@@ -33,18 +34,21 @@ var (
 	_ GraphNodeExecutable          = (*NodeDestroyResourceInstance)(nil)
 	_ GraphNodeProviderConsumer    = (*NodeDestroyResourceInstance)(nil)
 	_ GraphNodeProvisionerConsumer = (*NodeDestroyResourceInstance)(nil)
+	_ GraphNodeActionCaller        = (*NodeDestroyResourceInstance)(nil)
 )
 
 func (n *NodeDestroyResourceInstance) Name() string {
 	return n.ResourceInstanceAddr().String() + " (destroy)"
 }
 
-func (n *NodeDestroyResourceInstance) ProvidedBy() (addr addrs.ProviderConfig, exact bool) {
+func (n *NodeDestroyResourceInstance) Provider() ProviderRef {
 	if n.Addr.Resource.Resource.Mode == addrs.DataResourceMode {
 		// indicate that this node does not require a configured provider
-		return nil, true
+		p := n.NodeAbstractResourceInstance.Provider()
+		p.Offline = true
+		return p
 	}
-	return n.NodeAbstractResourceInstance.ProvidedBy()
+	return n.NodeAbstractResourceInstance.Provider()
 }
 
 // GraphNodeDestroyer
@@ -79,51 +83,8 @@ func (n *NodeDestroyResourceInstance) ModifyCreateBeforeDestroy(v bool) error {
 
 // GraphNodeReferenceable, overriding NodeAbstractResource
 func (n *NodeDestroyResourceInstance) ReferenceableAddrs() []addrs.Referenceable {
-	normalAddrs := n.NodeAbstractResourceInstance.ReferenceableAddrs()
-	destroyAddrs := make([]addrs.Referenceable, len(normalAddrs))
-
-	phaseType := addrs.ResourceInstancePhaseDestroy
-	if n.CreateBeforeDestroy() {
-		phaseType = addrs.ResourceInstancePhaseDestroyCBD
-	}
-
-	for i, normalAddr := range normalAddrs {
-		switch ta := normalAddr.(type) {
-		case addrs.Resource:
-			destroyAddrs[i] = ta.Phase(phaseType)
-		case addrs.ResourceInstance:
-			destroyAddrs[i] = ta.Phase(phaseType)
-		default:
-			destroyAddrs[i] = normalAddr
-		}
-	}
-
-	return destroyAddrs
-}
-
-// GraphNodeReferencer, overriding NodeAbstractResource
-func (n *NodeDestroyResourceInstance) References() []*addrs.Reference {
-	// If we have a config, then we need to include destroy-time dependencies
-	if c := n.Config; c != nil && c.Managed != nil {
-		var result []*addrs.Reference
-
-		// We include conn info and config for destroy time provisioners
-		// as dependencies that we have.
-		for _, p := range c.Managed.Provisioners {
-			schema := n.ProvisionerSchemas[p.Type]
-
-			if p.When == configs.ProvisionerWhenDestroy {
-				if p.Connection != nil {
-					result = append(result, ReferencesFromConfig(p.Connection.Config, connectionBlockSupersetSchema)...)
-				}
-				result = append(result, ReferencesFromConfig(p.Config, schema)...)
-			}
-		}
-
-		return result
-	}
-
-	return nil
+	// a destroy node is not referenceable
+	return []addrs.Referenceable{}
 }
 
 // GraphNodeExecutable
@@ -154,15 +115,8 @@ func (n *NodeDestroyResourceInstance) managedResourceExecute(ctx EvalContext) (d
 	var changeApply *plans.ResourceInstanceChange
 	var state *states.ResourceInstanceObject
 
-	_, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
-	diags = diags.Append(err)
-	if diags.HasErrors() {
-		return diags
-	}
-
-	changeApply, err = n.readDiff(ctx, providerSchema)
-	diags = diags.Append(err)
-	if changeApply == nil || diags.HasErrors() {
+	changeApply = ctx.Changes().GetResourceInstanceChange(n.Addr, addrs.NotDeposed)
+	if changeApply == nil {
 		return diags
 	}
 
@@ -203,6 +157,14 @@ func (n *NodeDestroyResourceInstance) managedResourceExecute(ctx EvalContext) (d
 		}
 	}
 
+	if n.hasBeforeActions() {
+		log.Printf("[DEBUG] NodeApplyableResourceInstance: invoking before actions for %s", n.Addr)
+		diags = diags.Append(n.invokeDestroyActions(ctx, configs.BeforeDestroy))
+		if diags.HasErrors() {
+			return diags
+		}
+	}
+
 	// Managed resources need to be destroyed, while data sources
 	// are only removed from state.
 	// we pass a nil configuration to apply because we are destroying
@@ -211,10 +173,29 @@ func (n *NodeDestroyResourceInstance) managedResourceExecute(ctx EvalContext) (d
 	// we don't return immediately here on error, so that the state can be
 	// finalized
 
-	err = n.writeResourceInstanceState(ctx, state, workingState)
+	err := n.writeResourceInstanceState(ctx, state, workingState)
 	if err != nil {
 		return diags.Append(err)
 	}
+
+	if policyGraph := ctx.PolicyGraph(); policyGraph != nil {
+		after := cty.NilVal
+		if state != nil {
+			after = state.Value
+		}
+		// The resource has been destroyed, so we add a policy node to send its data
+		// for policy evaluation.
+		policyGraph.Add(&nodeResourcePolicy{
+			ResourceAddr: changeApply.Addr,
+			ProviderAddr: changeApply.ProviderAddr,
+			Before:       changeApply.Before,
+			After:        after,
+			Action:       changeApply.Action,
+		})
+	}
+
+	// after destroy we continue to use the before value, since there is no after
+	diags = diags.Append(n.invokeDestroyActions(ctx, configs.AfterDestroy))
 
 	// create the err value for postApplyHook
 	diags = diags.Append(n.postApplyHook(ctx, state, diags.Err()))

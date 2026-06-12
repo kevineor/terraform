@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package jsonplan
@@ -13,7 +13,6 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/command/jsonstate"
-	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/terraform"
@@ -30,7 +29,7 @@ type stateValues struct {
 // resource, whose structure depends on the resource type schema.
 type attributeValues map[string]interface{}
 
-func marshalAttributeValues(value cty.Value, schema *configschema.Block) attributeValues {
+func marshalAttributeValues(value cty.Value) attributeValues {
 	if value == cty.NilVal || value.IsNull() {
 		return nil
 	}
@@ -104,10 +103,10 @@ func marshalPlannedValues(changes *plans.ChangesSrc, schemas *terraform.Schemas)
 	seenModules := make(map[string]bool)
 
 	for _, resource := range changes.Resources {
-		// If the resource is being deleted, skip over it.
+		// If the resource is being deleted or forgotten (removed from state), skip over it.
 		// Deposed instances are always conceptually a destroy, but if they
 		// were gone during refresh then the change becomes a noop.
-		if resource.Action != plans.Delete && resource.DeposedKey == states.NotDeposed {
+		if resource.Action != plans.Delete && resource.Action != plans.Forget && resource.DeposedKey == states.NotDeposed {
 			containingModule := resource.Addr.Module.String()
 			moduleResourceMap[containingModule] = append(moduleResourceMap[containingModule], resource.Addr)
 
@@ -171,7 +170,7 @@ func marshalPlanResources(changes *plans.ChangesSrc, ris []addrs.AbsResourceInst
 
 	for _, ri := range ris {
 		r := changes.ResourceInstance(ri)
-		if r.Action == plans.Delete {
+		if r.Action == plans.Delete || r.Action == plans.Forget {
 			continue
 		}
 
@@ -220,10 +219,10 @@ func marshalPlanResources(changes *plans.ChangesSrc, ris []addrs.AbsResourceInst
 
 		if changeV.After != cty.NilVal {
 			if changeV.After.IsWhollyKnown() {
-				resource.AttributeValues = marshalAttributeValues(changeV.After, schema.Body)
+				resource.AttributeValues = marshalAttributeValues(changeV.After)
 			} else {
 				knowns := omitUnknowns(changeV.After)
-				resource.AttributeValues = marshalAttributeValues(knowns, schema.Body)
+				resource.AttributeValues = marshalAttributeValues(knowns)
 			}
 		}
 
@@ -233,6 +232,12 @@ func marshalPlanResources(changes *plans.ChangesSrc, ris []addrs.AbsResourceInst
 			return nil, err
 		}
 		resource.SensitiveValues = v
+
+		if schema.Identity != nil && !changeV.AfterIdentity.IsNull() {
+			identityVersion := uint64(schema.IdentityVersion)
+			resource.IdentitySchemaVersion = &identityVersion
+			resource.IdentityValues = marshalAttributeValues(changeV.AfterIdentity)
+		}
 
 		ret = append(ret, resource)
 	}

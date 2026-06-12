@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/hashicorp/cli"
 	svchost "github.com/hashicorp/terraform-svchost"
 	"github.com/hashicorp/terraform-svchost/disco"
 	"github.com/zclconf/go-cty/cty"
@@ -50,6 +51,7 @@ import (
 	"github.com/hashicorp/terraform/internal/states/statefile"
 	"github.com/hashicorp/terraform/internal/states/statemgr"
 	"github.com/hashicorp/terraform/internal/terminal"
+	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/version"
 )
 
@@ -98,10 +100,10 @@ func TestMain(m *testing.M) {
 // similar to the following when initializing your test:
 //
 //	wd := tempWorkingDir(t)
-//	defer testChdir(t, wd.RootModuleDir())()
+//	t.Chdir(wd.RootModuleDir())
 //
-// Note that testChdir modifies global state for the test process, and so a
-// test using this pattern must never call t.Parallel().
+// Note that t.Chdir() modifies global state for the test process, and so a
+// test using this pattern is incompatible with use of t.Parallel().
 func tempWorkingDir(t *testing.T) *workdir.Dir {
 	t.Helper()
 
@@ -116,8 +118,8 @@ func tempWorkingDir(t *testing.T) *workdir.Dir {
 //
 // The same caveats about working directory apply as for testWorkingDir. See
 // the testWorkingDir commentary for an example of how to use this function
-// along with testChdir to meet the expectations of command.Meta legacy
-// functionality.
+// along with t.TempDir and t.Chdir from the testing library to meet the
+// expectations of command.Meta legacy functionality.
 func tempWorkingDirFixture(t *testing.T, fixtureName string) *workdir.Dir {
 	t.Helper()
 
@@ -135,6 +137,26 @@ func tempWorkingDirFixture(t *testing.T, fixtureName string) *workdir.Dir {
 
 func testFixturePath(name string) string {
 	return filepath.Join(fixtureDir, name)
+}
+
+func testPolicyFixtureDir(t *testing.T) string {
+	t.Helper()
+
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("plan"), td)
+	t.Chdir(td)
+
+	policyCode := `		resource_policy "resource_type" "policy_name" {
+		  enforce_attrs {
+		    key = attr.value == "foo"
+		  }
+		}
+	`
+	if err := os.WriteFile(filepath.Join(td, "policy.hcl"), []byte(policyCode), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	return td
 }
 
 func metaOverridesForProvider(p providers.Interface) *testingOverrides {
@@ -158,15 +180,31 @@ func testModuleWithSnapshot(t *testing.T, name string) (*configs.Config, *config
 	// Test modules usually do not refer to remote sources, and for local
 	// sources only this ultimately just records all of the module paths
 	// in a JSON file so that we can load them below.
-	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil))
-	_, instDiags := inst.InstallModules(context.Background(), dir, "tests", true, false, initwd.ModuleInstallHooksImpl{})
+	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), nil)
+	_, instDiags := inst.InstallModules(context.Background(), dir, "tests", true, false)
 	if instDiags.HasErrors() {
 		t.Fatal(instDiags.Err())
 	}
 
-	config, snap, diags := loader.LoadConfigWithSnapshot(dir)
-	if diags.HasErrors() {
-		t.Fatal(diags.Error())
+	rootMod, configDiags := loader.LoadRootModule(dir)
+	if configDiags.HasErrors() {
+		t.Fatal(configDiags.Error())
+	}
+
+	walkerSnapshot, snap := loader.ModuleWalkerSnapshot()
+	config, buildDiags := terraform.BuildConfigWithGraph(
+		rootMod,
+		walkerSnapshot,
+		nil,
+		configs.MockDataLoaderFunc(loader.LoadExternalMockData),
+	)
+	if buildDiags.HasErrors() {
+		t.Fatal(buildDiags.Err())
+	}
+
+	snapDiags := loader.AddRootModuleToSnapshot(snap, dir)
+	if snapDiags.HasErrors() {
+		t.Fatal(snapDiags.Error())
 	}
 
 	return config, snap
@@ -188,12 +226,13 @@ func testPlan(t *testing.T) *plans.Plan {
 	}
 
 	return &plans.Plan{
-		Backend: plans.Backend{
+		Backend: &plans.Backend{
 			// This is just a placeholder so that the plan file can be written
 			// out. Caller may wish to override it to something more "real"
 			// where the plan will actually be subsequently applied.
-			Type:   "local",
-			Config: backendConfigRaw,
+			Type:      "local",
+			Config:    backendConfigRaw,
+			Workspace: "default",
 		},
 		Changes: plans.NewChangesSrc(),
 
@@ -207,6 +246,77 @@ func testPlan(t *testing.T) *plans.Plan {
 
 func testPlanFile(t *testing.T, configSnap *configload.Snapshot, state *states.State, plan *plans.Plan) string {
 	return testPlanFileMatchState(t, configSnap, state, plan, statemgr.SnapshotMeta{})
+}
+
+func TestPlan_PoliciesRequireExperimentalFeatures(t *testing.T) {
+	td := testPolicyFixtureDir(t)
+
+	p := planFixtureProvider()
+	view, done := testView(t)
+	c := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             view,
+		},
+	}
+
+	code := c.Run([]string{"-policies", td, "-no-color"})
+	output := done(t)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d\n\n%s", code, output.All())
+	}
+	if got := output.Stderr(); !strings.Contains(got, "The -policies flag is only valid in experimental builds of Terraform.") {
+		t.Fatalf("expected policy experiment gating diagnostic, got: %s", got)
+	}
+	if strings.Contains(output.All(), "Failed to connect to policy engine") {
+		t.Fatalf("policy engine should not be initialized when experiments are disabled: %s", output.All())
+	}
+}
+
+func TestApply_PoliciesRequireExperimentalFeatures(t *testing.T) {
+	td := testPolicyFixtureDir(t)
+
+	p := planFixtureProvider()
+	view, done := testView(t)
+	c := &ApplyCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             view,
+		},
+	}
+
+	code := c.Run([]string{"-policies", td, "-no-color", "-auto-approve"})
+	output := done(t)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d\n\n%s", code, output.All())
+	}
+	if got := output.Stderr(); !strings.Contains(got, "The -policies flag is only valid in experimental builds of Terraform.") {
+		t.Fatalf("expected policy experiment gating diagnostic, got: %s", got)
+	}
+	if strings.Contains(output.All(), "Failed to connect to policy engine") {
+		t.Fatalf("policy engine should not be initialized when experiments are disabled: %s", output.All())
+	}
+}
+
+func TestInit_PoliciesRequireExperimentalFeatures(t *testing.T) {
+	td := testPolicyFixtureDir(t)
+
+	view, done := testView(t)
+	c := &InitCommand{
+		Meta: Meta{
+			Ui:   new(cli.MockUi),
+			View: view,
+		},
+	}
+
+	code := c.Run([]string{"-policies", td, "-no-color"})
+	output := done(t)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d\n\n%s", code, output.All())
+	}
+	if got := output.Stderr(); !strings.Contains(got, "The -policies flag is only valid in experimental builds of Terraform.") {
+		t.Fatalf("expected policy experiment gating diagnostic, got: %s", got)
+	}
 }
 
 func testPlanFileMatchState(t *testing.T, configSnap *configload.Snapshot, state *states.State, plan *plans.Plan, stateMeta statemgr.SnapshotMeta) string {
@@ -463,7 +573,14 @@ func testStateFile(t *testing.T, s *states.State) string {
 }
 
 // testStateFileDefault writes the state out to the default statefile
-// in the cwd. Use `testCwd` to change into a temp cwd.
+// in the cwd.
+//
+// Before calling this, use:
+//
+//	tmp := t.TempDir()
+//	t.Chdir(tmp)
+//
+// to change into a temp working directory
 func testStateFileDefault(t *testing.T, s *states.State) {
 	t.Helper()
 
@@ -479,7 +596,14 @@ func testStateFileDefault(t *testing.T, s *states.State) {
 }
 
 // testStateFileWorkspaceDefault writes the state out to the default statefile
-// for the given workspace in the cwd. Use `testCwd` to change into a temp cwd.
+// for the given workspace in the cwd.
+//
+// Before calling this, use:
+//
+//	tmp := t.TempDir()
+//	t.Chdir(tmp)
+//
+// to change into a temp working directory
 func testStateFileWorkspaceDefault(t *testing.T, workspace string, s *states.State) string {
 	t.Helper()
 
@@ -504,7 +628,14 @@ func testStateFileWorkspaceDefault(t *testing.T, workspace string, s *states.Sta
 }
 
 // testStateFileRemote writes the state out to the remote statefile
-// in the cwd. Use `testCwd` to change into a temp cwd.
+// in the cwd.
+//
+// Before calling this, use:
+//
+//	tmp := t.TempDir()
+//	t.Chdir(tmp)
+//
+// to change into a temp working directory
 func testStateFileRemote(t *testing.T, s *workdir.BackendStateFile) string {
 	t.Helper()
 
@@ -616,52 +747,6 @@ func testTempDir(t *testing.T) string {
 	return d
 }
 
-// testChdir changes the directory and returns a function to defer to
-// revert the old cwd.
-func testChdir(t *testing.T, new string) func() {
-	t.Helper()
-
-	old, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	if err := os.Chdir(new); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	return func() {
-		// Re-run the function ignoring the defer result
-		testChdir(t, old)
-	}
-}
-
-// testCwd is used to change the current working directory into a temporary
-// directory. The cleanup is performed automatically after the test and all its
-// subtests complete.
-func testCwd(t *testing.T) string {
-	t.Helper()
-
-	tmp := t.TempDir()
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	if err := os.Chdir(tmp); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	t.Cleanup(func() {
-		if err := os.Chdir(cwd); err != nil {
-			t.Fatalf("err: %v", err)
-		}
-	})
-
-	return tmp
-}
-
 // testStdinPipe changes os.Stdin to be a pipe that sends the data from
 // the reader before closing the pipe.
 //
@@ -682,7 +767,10 @@ func testStdinPipe(t *testing.T, src io.Reader) func() {
 	// Copy the data from the reader to the pipe
 	go func() {
 		defer w.Close()
-		io.Copy(w, src)
+		_, err := io.Copy(w, src)
+		if err != nil {
+			t.Errorf("error when copying data from testStdinPipe reader argument to stdin: %s", err)
+		}
 	}()
 
 	return func() {
@@ -754,7 +842,10 @@ func testInteractiveInput(t *testing.T, answers []string) func() {
 // testInputMap configures tests so that the given answers are returned
 // for calls to Input when the right question is asked. The key is the
 // question "Id" that is used.
-func testInputMap(t *testing.T, answers map[string]string) func() {
+//
+// Calling code can optionally use the returned buffer to make assertions
+// about the prompts shown the to the user.
+func testInputMap(t *testing.T, answers map[string]string) *bytes.Buffer {
 	t.Helper()
 
 	// Disable test mode so input is called
@@ -762,15 +853,16 @@ func testInputMap(t *testing.T, answers map[string]string) func() {
 
 	// Set up reader/writers
 	defaultInputReader = bytes.NewBufferString("")
-	defaultInputWriter = new(bytes.Buffer)
+	inputWriter := new(bytes.Buffer)
+	defaultInputWriter = inputWriter
 
 	// Setup answers
 	testInputResponse = nil
 	testInputResponseMap = answers
 
-	// Return the cleanup
-	return func() {
-		var unusedAnswers = testInputResponseMap
+	// Queue the cleanup for the end of the test
+	t.Cleanup(func() {
+		unusedAnswers := testInputResponseMap
 
 		// First, clean up!
 		test = true
@@ -779,7 +871,9 @@ func testInputMap(t *testing.T, answers map[string]string) func() {
 		if len(unusedAnswers) > 0 {
 			t.Fatalf("expected no unused answers provided to command.testInputMap, got: %v", unusedAnswers)
 		}
-	}
+	})
+
+	return inputWriter
 }
 
 // testBackendState is used to make a test HTTP server to test a configured
@@ -839,7 +933,7 @@ func testBackendState(t *testing.T, s *states.State, c int) (*workdir.BackendSta
 	hash := backendConfig.Hash(configSchema)
 
 	state := workdir.NewBackendStateFile()
-	state.Backend = &workdir.BackendState{
+	state.Backend = &workdir.BackendConfigState{
 		Type:      "http",
 		ConfigRaw: json.RawMessage(fmt.Sprintf(`{"address":%q}`, srv.URL)),
 		Hash:      uint64(hash),
@@ -877,7 +971,7 @@ func testRemoteState(t *testing.T, s *states.State, c int) (*workdir.BackendStat
 	retState := workdir.NewBackendStateFile()
 
 	srv := httptest.NewServer(http.HandlerFunc(cb))
-	b := &workdir.BackendState{
+	b := &workdir.BackendConfigState{
 		Type: "http",
 	}
 	b.SetConfig(cty.ObjectVal(map[string]cty.Value{
@@ -1159,6 +1253,79 @@ func checkGoldenReference(t *testing.T, output *terminal.TestOutput, fixturePath
 		t.Fatalf("failed to read output file: %s", err)
 	}
 	want := string(wantBytes)
+
+	got := output.Stdout()
+
+	// Split the output and the reference into lines so that we can compare
+	// messages
+	got = strings.TrimSuffix(got, "\n")
+	gotLines := strings.Split(got, "\n")
+
+	want = strings.TrimSuffix(want, "\n")
+	wantLines := strings.Split(want, "\n")
+
+	if len(gotLines) != len(wantLines) {
+		t.Errorf("unexpected number of log lines: got %d, want %d\n"+
+			"NOTE: This failure may indicate a UI change affecting the behavior of structured run output on HCP Terraform.\n"+
+			"Please communicate with HCP Terraform team before resolving", len(gotLines), len(wantLines))
+	}
+
+	// Verify that the log starts with a version message
+	type versionMessage struct {
+		Level     string `json:"@level"`
+		Message   string `json:"@message"`
+		Type      string `json:"type"`
+		Terraform string `json:"terraform"`
+		UI        string `json:"ui"`
+	}
+	var gotVersion versionMessage
+	if err := json.Unmarshal([]byte(gotLines[0]), &gotVersion); err != nil {
+		t.Errorf("failed to unmarshal version line: %s\n%s", err, gotLines[0])
+	}
+	wantVersion := versionMessage{
+		"info",
+		fmt.Sprintf("Terraform %s", version.String()),
+		"version",
+		version.String(),
+		views.JSON_UI_VERSION,
+	}
+	if !cmp.Equal(wantVersion, gotVersion) {
+		t.Errorf("unexpected first message:\n%s", cmp.Diff(wantVersion, gotVersion))
+	}
+
+	// Compare the rest of the lines against the golden reference
+	var gotLineMaps []map[string]interface{}
+	for i, line := range gotLines[1:] {
+		index := i + 1
+		var gotMap map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &gotMap); err != nil {
+			t.Errorf("failed to unmarshal got line %d: %s\n%s", index, err, gotLines[index])
+		}
+		if _, ok := gotMap["@timestamp"]; !ok {
+			t.Errorf("missing @timestamp field in log: %s", gotLines[index])
+		}
+		delete(gotMap, "@timestamp")
+		gotLineMaps = append(gotLineMaps, gotMap)
+	}
+	var wantLineMaps []map[string]interface{}
+	for i, line := range wantLines[1:] {
+		index := i + 1
+		var wantMap map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &wantMap); err != nil {
+			t.Errorf("failed to unmarshal want line %d: %s\n%s", index, err, gotLines[index])
+		}
+		wantLineMaps = append(wantLineMaps, wantMap)
+	}
+	if diff := cmp.Diff(wantLineMaps, gotLineMaps); diff != "" {
+		t.Errorf("wrong output lines\n%s\n"+
+			"NOTE: This failure may indicate a UI change affecting the behavior of structured run output on TFC.\n"+
+			"Please communicate with HCP Terraform team before resolving", diff)
+	}
+}
+
+func checkGoldenReferenceStr(t *testing.T, output *terminal.TestOutput, out string) {
+	t.Helper()
+	want := out
 
 	got := output.Stdout()
 

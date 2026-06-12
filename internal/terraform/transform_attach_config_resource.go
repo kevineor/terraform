@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -23,9 +23,17 @@ type GraphNodeAttachResourceConfig interface {
 	AttachResourceConfig(*configs.Resource, *configs.Removed)
 }
 
+// GraphNodeAttachActionTriggers is used by the AttachResourceConfigTransformer to
+// attach configuration to action callers.
+type GraphNodeAttachActionTriggers interface {
+	GraphNodeAttachResourceConfig
+
+	AttachActionTriggers([]*resourceActionTrigger)
+}
+
 // AttachResourceConfigTransformer goes through the graph and attaches
 // resource configuration structures to nodes that implement
-// GraphNodeAttachManagedResourceConfig or GraphNodeAttachDataResourceConfig.
+// GraphNodeAttachResourceConfig.
 //
 // The attached configuration structures are directly from the configuration.
 // If they're going to be modified, a copy should be made.
@@ -51,9 +59,18 @@ func (t *AttachResourceConfigTransformer) Transform(g *Graph) error {
 		}
 	})
 
+	// action nodes must be embedded along with the configured action refs, so
+	// first find any action nodes that have already been inserted
+	actionConfigNodes := addrs.MakeMap[addrs.ConfigAction, *NodeActionConfig]()
+	for _, v := range g.Vertices() {
+		switch v := v.(type) {
+		case *NodeActionConfig:
+			actionConfigNodes.Put(v.ActionAddr(), v)
+		}
+	}
+
 	// Go through and find GraphNodeAttachResource
 	for _, v := range g.Vertices() {
-		// Only care about GraphNodeAttachResource implementations
 		arn, ok := v.(GraphNodeAttachResourceConfig)
 		if !ok {
 			continue
@@ -86,6 +103,15 @@ func (t *AttachResourceConfigTransformer) Transform(g *Graph) error {
 				} else {
 					log.Printf("[TRACE] AttachResourceConfigTransformer: no provider meta configs available to attach to %s", dag.VertexName(v))
 				}
+			}
+
+			if aat, ok := v.(GraphNodeAttachActionTriggers); ok {
+				triggers, triggerDiags := buildActionTriggers(r, addr.Module, actionConfigNodes)
+				if triggerDiags.HasErrors() {
+					return triggerDiags.ErrWithWarnings()
+				}
+
+				aat.AttachActionTriggers(triggers)
 			}
 		}
 	}

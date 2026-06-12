@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package stackeval
@@ -86,7 +86,7 @@ func CheckProviderInLockfile(locks depsfile.Locks, providerType *ProviderType, d
 			Severity: hcl.DiagError,
 			Summary:  "Provider missing from lockfile",
 			Detail: fmt.Sprintf(
-				"Provider %q is not in the lockfile. This provider must be in the lockfile to be used in the configuration. Please run `tfstacks providers lock` to update the lockfile and run this operation again with an updated configuration.",
+				"Provider %q is not in the lockfile. This provider must be in the lockfile to be used in the configuration. Please run `terraform stacks providers lock` to update the lockfile and run this operation again with an updated configuration.",
 				providerType.Addr(),
 			),
 			Subject: declRange,

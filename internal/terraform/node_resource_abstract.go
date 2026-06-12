@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -87,6 +87,22 @@ type NodeAbstractResource struct {
 	generateConfigPath string
 
 	forceCreateBeforeDestroy bool
+
+	// overridePreventDestroy is set during test cleanup operations to allow
+	// tests to clean up any created infrastructure regardless of this setting
+	// in the configuration.
+	overridePreventDestroy bool
+
+	// actionTriggers records all triggers and their referenced actions.
+	// We hold a pointer to the action nodes from the referencing trigger, so
+	// that the action nodes can be resolved to the correct provider in the
+	// graph, while allowing the triggering node to also connect to the same
+	// provider.
+	actionTriggers []*resourceActionTrigger
+
+	// If we have already planned the changes, then we have actionApplyTriggers
+	// instead of actionTriggers
+	actionApplyTriggers []*actionTriggerApplyInstance
 }
 
 var (
@@ -104,6 +120,8 @@ var (
 	_ graphNodeAttachDataResourceDependsOn = (*NodeAbstractResource)(nil)
 	_ dag.GraphNodeDotter                  = (*NodeAbstractResource)(nil)
 	_ GraphNodeDestroyerCBD                = (*NodeAbstractResource)(nil)
+	_ GraphNodeActionProviderConsumer      = (*NodeAbstractResource)(nil)
+	_ GraphNodeActionCaller                = (*NodeAbstractResource)(nil)
 )
 
 // NewNodeAbstractResource creates an abstract resource graph node for
@@ -113,24 +131,6 @@ func NewNodeAbstractResource(addr addrs.ConfigResource) *NodeAbstractResource {
 		Addr: addr,
 	}
 }
-
-var (
-	_ GraphNodeModuleInstance            = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeReferenceable             = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeReferencer                = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeProviderConsumer          = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeProvisionerConsumer       = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeConfigResource            = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeResourceInstance          = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeAttachResourceState       = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeAttachResourceConfig      = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeAttachResourceSchema      = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeAttachProvisionerSchema   = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeAttachProviderMetaConfigs = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeTargetable                = (*NodeAbstractResourceInstance)(nil)
-	_ GraphNodeOverridable               = (*NodeAbstractResourceInstance)(nil)
-	_ dag.GraphNodeDotter                = (*NodeAbstractResourceInstance)(nil)
-)
 
 func (n *NodeAbstractResource) Name() string {
 	return n.ResourceAddr().String()
@@ -167,68 +167,107 @@ func (n *NodeAbstractResource) ModifyCreateBeforeDestroy(v bool) error {
 // GraphNodeReferencer
 func (n *NodeAbstractResource) References() []*addrs.Reference {
 	var result []*addrs.Reference
-	// If we have a config then we prefer to use that.
-	if c := n.Config; c != nil {
-		result = append(result, n.DependsOn()...)
 
-		if n.Schema == nil {
-			// Should never happen, but we'll log if it does so that we can
-			// see this easily when debugging.
-			log.Printf("[WARN] no schema is attached to %s, so config references cannot be detected", n.Name())
-		}
+	if n.Config == nil {
+		// you can't have references without configuration
+		return nil
+	}
 
-		refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, c.Count)
+	result = append(result, n.DependsOn()...)
+
+	if n.Schema == nil {
+		// Should never happen, but we'll log if it does so that we can
+		// see this easily when debugging.
+		log.Printf("[WARN] no schema is attached to %s, so config references cannot be detected", n.Name())
+	}
+
+	refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, n.Config.Count)
+	result = append(result, refs...)
+	refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, n.Config.ForEach)
+	result = append(result, refs...)
+
+	for _, expr := range n.Config.TriggersReplacement {
+		refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, expr)
 		result = append(result, refs...)
-		refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, c.ForEach)
-		result = append(result, refs...)
+	}
 
-		for _, expr := range c.TriggersReplacement {
-			refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, expr)
+	// ReferencesInBlock() requires a schema
+	if n.Schema != nil {
+		refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, n.Config.Config, n.Schema.Body)
+		result = append(result, refs...)
+	}
+
+	if n.Config.Managed != nil {
+		if n.Config.Managed.Connection != nil {
+			refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, n.Config.Managed.Connection.Config, connectionBlockSupersetSchema)
 			result = append(result, refs...)
 		}
 
-		// ReferencesInBlock() requires a schema
-		if n.Schema != nil {
-			refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, c.Config, n.Schema.Body)
-			result = append(result, refs...)
-		}
-
-		if c.Managed != nil {
-			if c.Managed.Connection != nil {
-				refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, c.Managed.Connection.Config, connectionBlockSupersetSchema)
+		for _, p := range n.Config.Managed.Provisioners {
+			if p.When != configs.ProvisionerWhenCreate {
+				continue
+			}
+			if p.Connection != nil {
+				refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, p.Connection.Config, connectionBlockSupersetSchema)
 				result = append(result, refs...)
 			}
 
-			for _, p := range c.Managed.Provisioners {
-				if p.When != configs.ProvisionerWhenCreate {
-					continue
-				}
-				if p.Connection != nil {
-					refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, p.Connection.Config, connectionBlockSupersetSchema)
-					result = append(result, refs...)
-				}
-
-				schema := n.ProvisionerSchemas[p.Type]
-				if schema == nil {
-					log.Printf("[WARN] no schema for provisioner %q is attached to %s, so provisioner block references cannot be detected", p.Type, n.Name())
-				}
-				refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, p.Config, schema)
-				result = append(result, refs...)
+			schema := n.ProvisionerSchemas[p.Type]
+			if schema == nil {
+				log.Printf("[WARN] no schema for provisioner %q is attached to %s, so provisioner block references cannot be detected", p.Type, n.Name())
 			}
+			refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, p.Config, schema)
+			result = append(result, refs...)
+		}
+	}
+
+	if n.Config.List != nil {
+		if n.Config.List.IncludeResource != nil {
+			refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, n.Config.List.IncludeResource)
+			result = append(result, refs...)
+		}
+		if n.Config.List.Limit != nil {
+			refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, n.Config.List.Limit)
+			result = append(result, refs...)
+		}
+	}
+
+	for _, check := range n.Config.Preconditions {
+		refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, check.Condition)
+		result = append(result, refs...)
+		refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
+		result = append(result, refs...)
+	}
+	for _, check := range n.Config.Postconditions {
+		refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, check.Condition)
+		result = append(result, refs...)
+		refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
+		result = append(result, refs...)
+	}
+
+	for _, trigger := range n.actionTriggers {
+		// Connect directly to the action nodes we have stored in the triggers
+		// to let those handle their own refs. This keep the graph structure
+		// more config-like, and takes care of dependencies and provider
+		// resolution. What it doesn't take care of is provider closing, so the
+		// resource will still have to produce it's own provider refs for
+		// actions.
+		for _, actionRef := range trigger.actionRefs {
+
+			result = append(result, &addrs.Reference{
+				Subject: actionRef.actionNode.Addr.Action,
+				// this is OK for References(), since they are only used to
+				// connect the graph, and don't need the source or any remaining
+				// traversal
+			})
 		}
 
-		for _, check := range c.Preconditions {
-			refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, check.Condition)
-			result = append(result, refs...)
-			refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
-			result = append(result, refs...)
-		}
-		for _, check := range c.Postconditions {
-			refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, check.Condition)
-			result = append(result, refs...)
-			refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
-			result = append(result, refs...)
-		}
+		refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, trigger.config.Condition)
+		result = append(result, refs...)
+	}
+
+	for _, trigger := range n.actionApplyTriggers {
+		refs = append(refs, trigger.References()...)
 	}
 
 	return result
@@ -277,27 +316,36 @@ func (n *NodeAbstractResource) SetProvider(p addrs.AbsProviderConfig) {
 }
 
 // GraphNodeProviderConsumer
-func (n *NodeAbstractResource) ProvidedBy() (addrs.ProviderConfig, bool) {
+func (n *NodeAbstractResource) Provider() ProviderRef {
 	// Once the provider is fully resolved, we can return the known value.
 	if n.ResolvedProvider.Provider.Type != "" {
-		return n.ResolvedProvider, true
+		return ProviderRef{
+			Addr:     n.ResolvedProvider,
+			Resolved: true,
+		}
 	}
 
 	// If we have a config we prefer that above all else
 	if n.Config != nil {
-		relAddr := n.Config.ProviderConfigAddr()
-		return addrs.LocalProviderConfig{
-			LocalName: relAddr.LocalName,
-			Alias:     relAddr.Alias,
-		}, false
+		return ProviderRef{
+			Addr: addrs.AbsProviderConfig{
+				Provider: n.Config.Provider,
+				Alias:    n.Config.ProviderConfigAddr().Alias,
+				Module:   n.ModulePath(),
+			},
+		}
 	}
 
 	// See if we have a valid provider config from the state.
 	if n.storedProviderConfig.Provider.Type != "" {
-		// An address from the state must match exactly, since we must ensure
-		// we refresh/destroy a resource with the same provider configuration
-		// that created it.
-		return n.storedProviderConfig, true
+		// An address from the state must match exactly, since we must ensure we
+		// refresh/destroy a resource with the same provider configuration that
+		// created it. Since we have no config, and no ResolvedProvider, the
+		// provider from the state counts as it being fully resolved.
+		return ProviderRef{
+			Addr:     n.storedProviderConfig,
+			Resolved: true,
+		}
 	}
 
 	// We might have an import target that is providing a specific provider,
@@ -308,39 +356,57 @@ func (n *NodeAbstractResource) ProvidedBy() (addrs.ProviderConfig, bool) {
 		// of them should be. They should also all have the same provider, so it
 		// shouldn't matter which we check here, as they'll all give the same.
 		if n.importTargets[0].Config != nil && n.importTargets[0].Config.ProviderConfigRef != nil {
-			return addrs.LocalProviderConfig{
-				LocalName: n.importTargets[0].Config.ProviderConfigRef.Name,
-				Alias:     n.importTargets[0].Config.ProviderConfigRef.Alias,
-			}, false
+			ref := ProviderRef{
+				Addr: addrs.AbsProviderConfig{
+					Provider: n.importTargets[0].Config.Provider,
+					Alias:    n.importTargets[0].Config.ProviderConfigRef.Alias,
+					Module:   n.ModulePath(),
+				},
+			}
+
+			ref.Addr.Alias = n.importTargets[0].Config.ProviderConfigRef.Alias
+			return ref
 		}
 	}
 
 	// No provider configuration found; return a default address
-	return addrs.AbsProviderConfig{
-		Provider: n.Provider(),
-		Module:   n.ModulePath(),
-	}, false
+	return ProviderRef{
+		Addr: addrs.AbsProviderConfig{
+			Provider: addrs.ImpliedProviderForUnqualifiedType(n.Addr.Resource.ImpliedProvider()),
+			Module:   n.ModulePath(),
+		},
+	}
 }
 
-// GraphNodeProviderConsumer
-func (n *NodeAbstractResource) Provider() addrs.Provider {
-	if n.Config != nil {
-		return n.Config.Provider
-	}
-	if n.storedProviderConfig.Provider.Type != "" {
-		return n.storedProviderConfig.Provider
+func (n *NodeAbstractResource) ActionProviders() []ProviderRef {
+	// actions are not stateful and only run directly from configuration, so we
+	// don't need all the dance around config vs state like in the main
+	// resource, and can just return the connected provider.
+
+	// we check both possible sources of actions depending on whether we are
+	// planning or applying
+	var res []ProviderRef
+	for _, trigger := range n.actionApplyTriggers {
+		res = append(res, ProviderRef{Addr: trigger.ActionInvocation.ProviderAddr, Resolved: true})
 	}
 
-	if len(n.importTargets) > 0 {
-		// The import targets should either all be defined via config or none
-		// of them should be. They should also all have the same provider, so it
-		// shouldn't matter which we check here, as they'll all give the same.
-		if n.importTargets[0].Config != nil {
-			return n.importTargets[0].Config.Provider
+	for _, trigger := range n.actionTriggers {
+		for _, actionRef := range trigger.actionRefs {
+			res = append(res, actionRef.actionNode.Provider())
 		}
 	}
+	return res
+}
 
-	return addrs.ImpliedProviderForUnqualifiedType(n.Addr.Resource.ImpliedProvider())
+func (n *NodeAbstractResource) ActionCalls() []addrs.ConfigAction {
+	var calls []addrs.ConfigAction
+
+	for _, trigger := range n.actionTriggers {
+		for _, actionRef := range trigger.actionRefs {
+			calls = append(calls, actionRef.actionNode.Addr)
+		}
+	}
+	return calls
 }
 
 // GraphNodeProvisionerConsumer
@@ -609,4 +675,26 @@ func graphNodesAreResourceInstancesInDifferentInstancesOfSameModule(a, b dag.Ver
 		return false
 	}
 	return !aModInst.Equal(bModInst)
+}
+
+type resourceActionTrigger struct {
+	config     *configs.ActionTrigger
+	actionRefs []actionRef
+}
+
+// actionRef stores the reference to an action config with the reference
+// expression itself, so that we can refine it to the individual action instance
+// during evaluation.
+type actionRef struct {
+	configRef   configs.ActionRef
+	blockIndex  int
+	actionIndex int
+
+	// Here we store a reference to the actual NodeActionConfig. While it's
+	// evaluated as if it were embedded within the caller, the action node is
+	// also its own entity in the graph for two reasons: - Provider resolution
+	// can happen via the standard methods - The action has its own expansion,
+	// which must be evaluated before the callers, and multiple callers may
+	// reference the same action node.
+	actionNode *NodeActionConfig
 }

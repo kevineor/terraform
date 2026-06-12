@@ -1,17 +1,70 @@
-## 1.13.0 (Unreleased)
+## 1.16.0 (Unreleased)
+
+
+NEW FEATURES:
+
+* Store PlannedPrivate data for providers ([#37986](https://github.com/hashicorp/terraform/issues/37986))
+
+* New store block in terraform_data that can handle ephemeral and sensitive values ([#38298](https://github.com/hashicorp/terraform/issues/38298))
+
+* Providers can now use nested blocks as computed values ([#38305](https://github.com/hashicorp/terraform/issues/38305))
+
+* import: add support for import blocks inside modules ([#38352](https://github.com/hashicorp/terraform/issues/38352))
+
+* We now produce builds for Linux s390x (zLinux) ([#38384](https://github.com/hashicorp/terraform/issues/38384))
+
+* workspace: The `workspace list` command can now produce machine-readable output when supplied with the `-json` flag ([#38397](https://github.com/hashicorp/terraform/issues/38397))
+
+
+ENHANCEMENTS:
+
+* feat(cli): terraform state show accepts a -json flag ([#23940](https://github.com/hashicorp/terraform/issues/23940))
+
+* Show info when resources are left behind due to skip_cleanup ([#38449](https://github.com/hashicorp/terraform/issues/38449))
+
+
+BUG FIXES:
+
+* import blocks no longer ignore provider local names ([#38338](https://github.com/hashicorp/terraform/issues/38338))
+
+* Fix a `terraform apply` panic when the plan contained a no-op change for a deposed object on a resource whose configuration declared a `lifecycle.precondition` or `lifecycle.postcondition` ([#38586](https://github.com/hashicorp/terraform/issues/38586))
+
+* workspace: Terraform will now error if an invalid workspace name becomes selected due to actions performed out-of-band ([#38594](https://github.com/hashicorp/terraform/issues/38594))
+
+* test: Terraform will now raise a warning when a file referenced via `-filter` flag does not exist. ([#38603](https://github.com/hashicorp/terraform/issues/38603))
+
+* init: Stop removing locks from the dependency lock file corresponding to providers configured as a dev_override ([#38634](https://github.com/hashicorp/terraform/issues/38634))
+
+* init: Add warnings when unmanaged providers are in use and will impact provider installation processes. ([#38656](https://github.com/hashicorp/terraform/issues/38656))
+
+
+NOTES:
+
+* init: Errors due to incompatible `-upgrade` and `-lockfile=readonly` flags are now raised earlier in the init process. ([#38561](https://github.com/hashicorp/terraform/issues/38561))
+
+
+UPGRADE NOTES:
+
+* Provisioner bastion_host_key is now correctly applied. Existing usage of bastion_host_key should verify the configured key is correct. ([#38318](https://github.com/hashicorp/terraform/issues/38318))
 
 
 EXPERIMENTS:
 
 Experiments are only enabled in alpha releases of Terraform CLI. The following features are not yet available in stable releases.
 
-- The new command `terraform rpcapi` exposes some Terraform Core functionality through an RPC interface compatible with [`go-plugin`](https://github.com/hashicorp/go-plugin). The exact RPC API exposed here is currently subject to change at any time, because it's here primarily as a vehicle to support the [Terraform Stacks](https://www.hashicorp.com/blog/terraform-stacks-explained) private preview and so will be broken if necessary to respond to feedback from private preview participants, or possibly for other reasons. Do not use this mechanism yet outside of Terraform Stacks private preview.
-- The experimental "deferred actions" feature, enabled by passing the `-allow-deferral` option to `terraform plan`, permits `count` and `for_each` arguments in `module`, `resource`, and `data` blocks to have unknown values and allows providers to react more flexibly to unknown values. This experiment is under active development, and so it's not yet useful to participate in this experiment
+- The experimental "deferred actions" feature, enabled by passing the `-allow-deferral` option to `terraform plan`, permits `count` and `for_each` arguments in `module`, `resource`, and `data` blocks to have unknown values and allows providers to react more flexibly to unknown values.
+- `terraform test cleanup`: The experimental `test cleanup` command. In experimental builds of Terraform, a manifest file and state files for each failed cleanup operation during test operations are saved within the `.terraform` local directory. The `test cleanup` command will attempt to clean up the local state files left behind automatically, without requiring manual intervention.
+- `terraform test`: `backend` blocks and `skip_cleanup` attributes:
+  - Test authors can now specify `backend` blocks within `run` blocks in Terraform Test files. Run blocks with `backend` blocks will load state from the specified backend instead of starting from empty state on every execution. This allows test authors to keep long-running test infrastructure alive between test operations, saving time during regular test operations.
+  - Test authors can now specify `skip_cleanup` attributes within test files and within run blocks. The `skip_cleanup` attribute tells `terraform test` not to clean up state files produced by run blocks with this attribute set to true. The state files for affected run blocks will be written to disk within the `.terraform` directory, where they can then be cleaned up manually using the also experimental `terraform test cleanup` command.
 
 ## Previous Releases
 
 For information on prior major and minor releases, refer to their changelogs:
 
+- [v1.15](https://github.com/hashicorp/terraform/blob/v1.15/CHANGELOG.md)
+- [v1.14](https://github.com/hashicorp/terraform/blob/v1.14/CHANGELOG.md)
+- [v1.13](https://github.com/hashicorp/terraform/blob/v1.13/CHANGELOG.md)
 - [v1.12](https://github.com/hashicorp/terraform/blob/v1.12/CHANGELOG.md)
 - [v1.11](https://github.com/hashicorp/terraform/blob/v1.11/CHANGELOG.md)
 - [v1.10](https://github.com/hashicorp/terraform/blob/v1.10/CHANGELOG.md)
