@@ -809,9 +809,8 @@ func TestMetaBackend_reconfigureBackendChange(t *testing.T) {
 }
 
 // Initializing a backend which supports workspaces and does *not* have
-// the currently selected workspace should prompt the user with a list of
-// workspaces to choose from to select a valid one, if more than one workspace
-// is available.
+// the currently selected workspace should automatically select the first
+// available workspace, even if more than one workspace is available.
 func TestMetaBackend_initBackendSelectedWorkspaceDoesNotExist(t *testing.T) {
 	// Create a temporary working directory that is empty
 	td := t.TempDir()
@@ -821,22 +820,13 @@ func TestMetaBackend_initBackendSelectedWorkspaceDoesNotExist(t *testing.T) {
 	// Setup the meta
 	m := testMetaBackend(t, nil)
 
-	terminalPrompts := testInputMap(t, map[string]string{
-		"select-workspace": "2",
-	})
-
 	// Get the backend
 	_, diags := m.Backend(&BackendOpts{Init: true})
 	if diags.HasErrors() {
 		t.Fatal(diags.Err())
 	}
 
-	expectedMsg := "The currently selected workspace (bar) does not exist"
-	if !strings.Contains(terminalPrompts.String(), expectedMsg) {
-		t.Errorf("expected error message to contain %q, but got %q", expectedMsg, terminalPrompts.String())
-	}
-
-	expected := "foo"
+	expected := "default"
 	actual, err := m.Workspace()
 	if err != nil {
 		t.Fatal(err)
@@ -890,7 +880,8 @@ func TestMetaBackend_initBackendSelectedWorkspaceDoesNotExistAutoSelect(t *testi
 }
 
 // Initializing a backend which supports workspaces and does *not* have
-// the currently selected workspace with input=false should fail.
+// the currently selected workspace with input=false should automatically
+// select the first available workspace instead of failing.
 func TestMetaBackend_initBackendSelectedWorkspaceDoesNotExistInputFalse(t *testing.T) {
 	// Create a temporary working directory that is empty
 	td := t.TempDir()
@@ -903,10 +894,18 @@ func TestMetaBackend_initBackendSelectedWorkspaceDoesNotExistInputFalse(t *testi
 
 	// Get the backend
 	_, diags := m.Backend(&BackendOpts{Init: true})
+	if diags.HasErrors() {
+		t.Fatal(diags.Err())
+	}
 
-	// Should fail immediately
-	if got, want := diags.ErrWithWarnings().Error(), `Currently selected workspace "bar" does not exist`; !strings.Contains(got, want) {
-		t.Fatalf("wrong error\ngot:  %s\nwant: %s", got, want)
+	expected := "default"
+	actual, err := m.Workspace()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if actual != expected {
+		t.Fatalf("expected selected workspace to be %q, but was %q", expected, actual)
 	}
 }
 

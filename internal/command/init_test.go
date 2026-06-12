@@ -4238,9 +4238,9 @@ Initializing provider plugins...
 
 	// Test what happens when the selected workspace doesn't exist, but there are other workspaces available.
 	//
-	// When input is disabled (in automation, etc) Terraform cannot prompts the user to select an alternative.
-	// Instead, an error is returned.
-	t.Run("error when input is disabled and the selected workspace doesn't exist and other custom workspaces do exist.", func(t *testing.T) {
+	// Even when input is disabled (in automation, etc) Terraform automatically selects the first
+	// available workspace.
+	t.Run("input disabled: Terraform automatically selects the first available workspace when the selected workspace doesn't exist.", func(t *testing.T) {
 		// Create a temporary, uninitialized working directory with configuration including a state store
 		td := t.TempDir()
 		testCopyDir(t, testFixturePath("init-with-state-store"), td)
@@ -4278,36 +4278,34 @@ Initializing provider plugins...
 			Meta: meta,
 		}
 
-		// If input is disabled users receive an error about the missing workspace
+		// Even with input disabled, Terraform automatically selects the first
+		// available workspace when the selected workspace doesn't exist.
 		args := []string{
 			"-enable-pluggable-state-storage-experiment=true",
 			"-input=false",
 		}
 		code := c.Run(args)
 		testOutput := done(t)
-		if code != 1 {
-			t.Fatalf("expected code 1 exit code, got %d, output: \n%s", code, testOutput.All())
+		if code != 0 {
+			t.Fatalf("expected code 0 exit code, got %d, output: \n%s", code, testOutput.All())
 		}
-		output := testOutput.All()
-		expectedOutput := "Failed to select a workspace: Currently selected workspace \"default\" does not exist"
-		if !strings.Contains(cleanString(output), expectedOutput) {
-			t.Fatalf("expected output to include %q, but got':\n %s", expectedOutput, cleanString(output))
-		}
-		statePath := filepath.Join(meta.DataDir(), DefaultStateFilename)
-		_, err := os.Stat(statePath)
-		if _, ok := err.(*os.PathError); !ok {
-			if err == nil {
-				t.Fatalf("expected backend state file to not be created, but it exists")
-			}
 
-			t.Fatalf("unexpected error: %s", err)
+		// The init command should have caused the selected workspace to change
+		// to the first available workspace.
+		currentWorkspace, err := c.Meta.Workspace()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if currentWorkspace != "foobar1" {
+			t.Fatalf("expected init command to alter the selected workspace from 'default' to 'foobar1', but got: %s", currentWorkspace)
 		}
 	})
 
 	// Test what happens when the selected workspace doesn't exist, but there are other workspaces available.
 	//
-	// When input is enabled Terraform prompts the user to select an alternative.
-	t.Run("if the selected workspace doesn't exist and other custom workspaces do exist, Terraform prompts the user to select a workspace .", func(t *testing.T) {
+	// When input is enabled Terraform still automatically selects the first available workspace,
+	// without prompting the user.
+	t.Run("input enabled: Terraform automatically selects the first available workspace when the selected workspace doesn't exist.", func(t *testing.T) {
 		// Create a temporary, uninitialized working directory with configuration including a state store
 		td := t.TempDir()
 		testCopyDir(t, testFixturePath("init-with-state-store"), td)
@@ -4326,12 +4324,6 @@ Initializing provider plugins...
 		mockProviderAddress := addrs.NewDefaultProvider("test")
 		providerSource := newMockProviderSource(t, map[string][]string{
 			"hashicorp/test": {"1.0.0"},
-		})
-
-		// Allow the test to respond to the prompt to pick an
-		// existing workspace, given the selected one doesn't exist.
-		_ = testInputMap(t, map[string]string{
-			"select-workspace": "1", // foobar1 in numbered list
 		})
 
 		ui := new(cli.MockUi)
@@ -4360,8 +4352,8 @@ Initializing provider plugins...
 			t.Fatalf("expected code 0 exit code, got %d, output: \n%s", code, testOutput.All())
 		}
 
-		// The init command should have caused the selected workspace to change, based on the input
-		// provided by the user.
+		// The init command should have caused the selected workspace to change
+		// to the first available workspace.
 		currentWorkspace, err := c.Meta.Workspace()
 		if err != nil {
 			t.Fatal(err)
