@@ -2530,6 +2530,188 @@ func TestTest_DynamicSourceWithVarFlag(t *testing.T) {
 	}
 }
 
+// TestTest_DynamicSourceWithTestFileVariables runs init with -var to install
+// the dynamically sourced module, then runs the test command without -var so
+// that the const variable's value can only come from the file-level variables
+// block within the test file.
+func TestTest_DynamicSourceWithTestFileVariables(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_with_test_file_variables")), td)
+	t.Chdir(td)
+
+	store := &testing_command.ResourceStore{
+		Data: make(map[string]cty.Value),
+	}
+	providerSource := newMockProviderSource(t, map[string][]string{
+		"test": {"1.0.0"},
+	})
+
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		testingOverrides: &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"): func() (providers.Interface, error) {
+					return testing_command.NewProvider(store).Provider, nil
+				},
+			},
+		},
+		Ui:             ui,
+		View:           view,
+		Streams:        streams,
+		ProviderSource: providerSource,
+	}
+
+	init := &InitCommand{Meta: meta}
+	if code := init.Run([]string{"-var", "module_name=example"}); code != 0 {
+		output := done(t)
+		t.Fatalf("expected status code 0 but got %d: %s", code, output.All())
+	}
+
+	// Reset the streams for the next command.
+	streams, done = terminal.StreamsForTesting(t)
+	meta.Streams = streams
+	meta.View = views.NewView(streams)
+
+	c := &TestCommand{Meta: meta}
+	code := c.Run([]string{"-no-color"})
+	output := done(t)
+
+	if code != 0 {
+		t.Errorf("expected status code 0 but got %d:\n\n%s", code, output.All())
+	}
+
+	if !strings.Contains(output.Stdout(), "1 passed, 0 failed.") {
+		t.Errorf("output didn't contain expected string:\n\n%s", output.Stdout())
+	}
+
+	if len(store.Data) != 0 {
+		t.Errorf("should have deleted all resources on completion but left %d", len(store.Data))
+	}
+}
+
+// TestTest_DynamicSourceWithTestDirTfvars runs init with -var to install the
+// dynamically sourced module, then runs the test command without -var so that
+// the const variable's value can only come from the terraform.tfvars file
+// inside the tests directory.
+func TestTest_DynamicSourceWithTestDirTfvars(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_with_test_dir_tfvars")), td)
+	t.Chdir(td)
+
+	store := &testing_command.ResourceStore{
+		Data: make(map[string]cty.Value),
+	}
+	providerSource := newMockProviderSource(t, map[string][]string{
+		"test": {"1.0.0"},
+	})
+
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		testingOverrides: &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"): func() (providers.Interface, error) {
+					return testing_command.NewProvider(store).Provider, nil
+				},
+			},
+		},
+		Ui:             ui,
+		View:           view,
+		Streams:        streams,
+		ProviderSource: providerSource,
+	}
+
+	init := &InitCommand{Meta: meta}
+	if code := init.Run([]string{"-var", "module_name=example"}); code != 0 {
+		output := done(t)
+		t.Fatalf("expected status code 0 but got %d: %s", code, output.All())
+	}
+
+	// Reset the streams for the next command.
+	streams, done = terminal.StreamsForTesting(t)
+	meta.Streams = streams
+	meta.View = views.NewView(streams)
+
+	c := &TestCommand{Meta: meta}
+	code := c.Run([]string{"-no-color"})
+	output := done(t)
+
+	if code != 0 {
+		t.Errorf("expected status code 0 but got %d:\n\n%s", code, output.All())
+	}
+
+	if !strings.Contains(output.Stdout(), "1 passed, 0 failed.") {
+		t.Errorf("output didn't contain expected string:\n\n%s", output.Stdout())
+	}
+
+	if len(store.Data) != 0 {
+		t.Errorf("should have deleted all resources on completion but left %d", len(store.Data))
+	}
+}
+
+// TestTest_DynamicSourceConflictingTestFiles verifies that the test command
+// raises an error when two test files set different values for a const
+// variable that is used to resolve a dynamic module source, since the
+// configuration is only loaded once and shared by every test file.
+func TestTest_DynamicSourceConflictingTestFiles(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_conflicting_test_files")), td)
+	t.Chdir(td)
+
+	store := &testing_command.ResourceStore{
+		Data: make(map[string]cty.Value),
+	}
+	providerSource := newMockProviderSource(t, map[string][]string{
+		"test": {"1.0.0"},
+	})
+
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		testingOverrides: &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"): func() (providers.Interface, error) {
+					return testing_command.NewProvider(store).Provider, nil
+				},
+			},
+		},
+		Ui:             ui,
+		View:           view,
+		Streams:        streams,
+		ProviderSource: providerSource,
+	}
+
+	init := &InitCommand{Meta: meta}
+	if code := init.Run([]string{"-var", "module_name=example"}); code != 0 {
+		output := done(t)
+		t.Fatalf("expected status code 0 but got %d: %s", code, output.All())
+	}
+
+	// Reset the streams for the next command.
+	streams, done = terminal.StreamsForTesting(t)
+	meta.Streams = streams
+	meta.View = views.NewView(streams)
+
+	c := &TestCommand{Meta: meta}
+	code := c.Run([]string{"-no-color"})
+	output := done(t)
+
+	if code != 1 {
+		t.Errorf("expected status code 1 but got %d:\n\n%s", code, output.All())
+	}
+
+	if !strings.Contains(output.Stderr(), "Conflicting values for const variable") {
+		t.Errorf("error didn't contain expected string:\n\n%s", output.Stderr())
+	}
+}
+
 func TestTest_DynamicSourceWithLocalValue(t *testing.T) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_with_local_value")), td)

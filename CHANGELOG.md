@@ -37,6 +37,8 @@ BUG FIXES:
 
 * init: Add warnings when unmanaged providers are in use and will impact provider installation processes. ([#38656](https://github.com/hashicorp/terraform/issues/38656))
 
+* test: `terraform test` now resolves dynamic module sources using const variable values provided by file-level `variables` blocks in test files and by tfvars files in the test directory, instead of failing with "No value for required variable".
+
 
 NOTES:
 

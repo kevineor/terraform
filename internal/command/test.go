@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/zclconf/go-cty/cty"
 
 	backendInit "github.com/hashicorp/terraform/internal/backend/init"
 	"github.com/hashicorp/terraform/internal/backend/local"
@@ -23,6 +24,7 @@ import (
 	"github.com/hashicorp/terraform/internal/command/junit"
 	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/configs"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/moduletest"
 	"github.com/hashicorp/terraform/internal/terraform"
@@ -364,11 +366,11 @@ func (m *Meta) setupTestExecution(mode moduletest.CommandMode, command string, r
 		view.Diagnostics(nil, nil, diags)
 		return
 	}
-	constVars := make(map[string]arguments.UnparsedVariableValue)
-	for name, val := range preparation.Variables {
-		if decl, exists := earlyMod.Variables[name]; exists && decl.Const {
-			constVars[name] = val
-		}
+	constVars, constDiags := collectConstVariableValues(earlyMod, preparation.Variables, preparation.TestVariables)
+	diags = diags.Append(constDiags)
+	if constDiags.HasErrors() {
+		view.Diagnostics(nil, nil, diags)
+		return
 	}
 	m.VariableValues = constVars
 
@@ -441,6 +443,109 @@ func (m *Meta) setupTestExecution(mode moduletest.CommandMode, command string, r
 	// testing.
 	view.Diagnostics(nil, nil, diags)
 	return
+}
+
+// collectConstVariableValues gathers values for the const variables declared
+// in the root module from all the variable sources available to
+// "terraform test", so that they can be used to resolve dynamic module
+// sources while loading the configuration.
+//
+// The precedence mirrors the one used by the test runtime: values from
+// tfvars files inside the test directory override global -var/-var-file
+// values, and file-level "variables" blocks within test files override both.
+// The configuration is loaded only once and shared by every test file, so
+// all test files must agree on the value of any const variable they set;
+// conflicting definitions produce an error.
+func collectConstVariableValues(mod *configs.Module, globalVars, testVars map[string]arguments.UnparsedVariableValue) (map[string]arguments.UnparsedVariableValue, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+	constVars := make(map[string]arguments.UnparsedVariableValue)
+
+	isConst := func(name string) bool {
+		decl, exists := mod.Variables[name]
+		return exists && decl.Const
+	}
+
+	for name, val := range globalVars {
+		if isConst(name) {
+			constVars[name] = val
+		}
+	}
+	for name, val := range testVars {
+		if isConst(name) {
+			constVars[name] = val
+		}
+	}
+
+	type fileValue struct {
+		filename string
+		value    cty.Value
+	}
+	seen := make(map[string]fileValue)
+	for _, filename := range slices.Sorted(maps.Keys(mod.Tests)) {
+		file := mod.Tests[filename]
+		for name, expr := range file.Variables {
+			if !isConst(name) {
+				continue
+			}
+
+			value, valueDiags := expr.Value(&hcl.EvalContext{
+				Functions: lang.TestingFunctions(),
+			})
+			if valueDiags.HasErrors() {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid value for const variable",
+					Detail:   fmt.Sprintf("The variable %q is declared as const and is used while loading the configuration, so its value within a test file must be a constant expression.", name),
+					Subject:  expr.Range().Ptr(),
+				})
+				continue
+			}
+
+			if prev, exists := seen[name]; exists {
+				if !value.RawEquals(prev.value) {
+					diags = diags.Append(&hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Conflicting values for const variable",
+						Detail:   fmt.Sprintf("The const variable %q is used to load the configuration, which is shared by all test files, so every test file must use the same value. A different value was given in %s.", name, prev.filename),
+						Subject:  expr.Range().Ptr(),
+					})
+				}
+				continue
+			}
+
+			seen[name] = fileValue{filename: filename, value: value}
+			constVars[name] = unparsedTestFileVariableValue{expr: expr}
+		}
+	}
+
+	return constVars, diags
+}
+
+// unparsedTestFileVariableValue wraps an expression from a file-level
+// "variables" block in a test file so it can be used as an
+// arguments.UnparsedVariableValue during configuration loading.
+type unparsedTestFileVariableValue struct {
+	expr hcl.Expression
+}
+
+var _ arguments.UnparsedVariableValue = unparsedTestFileVariableValue{}
+
+func (v unparsedTestFileVariableValue) ParseVariableValue(mode configs.VariableParsingMode) (*terraform.InputValue, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	value, valueDiags := v.expr.Value(&hcl.EvalContext{
+		Functions: lang.TestingFunctions(),
+	})
+	diags = diags.Append(valueDiags)
+	if valueDiags.HasErrors() {
+		return nil, diags
+	}
+
+	return &terraform.InputValue{
+		Value:       value,
+		SourceType:  terraform.ValueFromConfig,
+		SourceRange: tfdiags.SourceRangeFromHCL(v.expr.Range()),
+	}, diags
 }
 
 // orderBackendsByDeclarationLine takes in a map of state keys to backend configs and returns a list of
