@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform/internal/tfdiags"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 
 	"github.com/hashicorp/terraform/internal/configs"
 )
@@ -82,37 +83,49 @@ func (t *ModuleVariableTransformer) transformSingle(g *Graph, parent, c *configs
 	// Find the call in the parent module configuration, so we can get the
 	// expressions given for each input variable at the call site.
 	callConfig, exists := parent.Module.ModuleCalls[call.Name]
-	if !exists {
-		// This should never happen, since it indicates an improperly-constructed
-		// configuration tree.
+	if !exists && hclsyntax.ValidIdentifier(call.Name) {
+		// Every module reached through a "module" block has its call site
+		// here. A module can also be attached to the configuration tree
+		// without one, in which case it has no caller and its variables take
+		// their default values below; the only modules attached this way are
+		// the configurations under test for test run blocks, which are keyed
+		// by a synthetic name that is deliberately not a valid identifier.
+		// The absence of a call for an ordinary, identifier-named module
+		// therefore indicates an improperly-constructed configuration tree.
 		panic(fmt.Errorf("no module call block found for %s", c.Path))
 	}
 
-	// We need to construct a schema for the expected call arguments based on
-	// the configured variables in our config, which we can then use to
-	// decode the content of the call block.
-	schema := &hcl.BodySchema{}
-	for _, v := range c.Module.Variables {
-		schema.Attributes = append(schema.Attributes, hcl.AttributeSchema{
-			Name:     v.Name,
-			Required: v.Default == cty.NilVal,
-		})
-	}
+	var content *hcl.BodyContent
+	if exists {
+		// We need to construct a schema for the expected call arguments based
+		// on the configured variables in our config, which we can then use to
+		// decode the content of the call block.
+		schema := &hcl.BodySchema{}
+		for _, v := range c.Module.Variables {
+			schema.Attributes = append(schema.Attributes, hcl.AttributeSchema{
+				Name:     v.Name,
+				Required: v.Default == cty.NilVal,
+			})
+		}
 
-	content, contentDiags := callConfig.Config.Content(schema)
-	if contentDiags.HasErrors() {
-		// Validation code elsewhere should deal with any errors before we
-		// get in here, but we'll report them out here just in case, to
-		// avoid crashes.
-		var diags tfdiags.Diagnostics
-		diags = diags.Append(contentDiags)
-		return diags.Err()
+		var contentDiags hcl.Diagnostics
+		content, contentDiags = callConfig.Config.Content(schema)
+		if contentDiags.HasErrors() {
+			// Validation code elsewhere should deal with any errors before we
+			// get in here, but we'll report them out here just in case, to
+			// avoid crashes.
+			var diags tfdiags.Diagnostics
+			diags = diags.Append(contentDiags)
+			return diags.Err()
+		}
 	}
 
 	for _, v := range c.Module.Variables {
 		var expr hcl.Expression
-		if attr := content.Attributes[v.Name]; attr != nil {
-			expr = attr.Expr
+		if content != nil {
+			if attr := content.Attributes[v.Name]; attr != nil {
+				expr = attr.Expr
+			}
 		}
 
 		// Add a plannable node, as the variable may expand

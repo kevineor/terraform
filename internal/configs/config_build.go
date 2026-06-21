@@ -97,6 +97,30 @@ func installMockDataFiles(root *Config, loader MockDataLoader) hcl.Diagnostics {
 	return diags
 }
 
+// TestRunModulePath returns the synthetic module path used to install and load
+// the alternative module configuration referenced by a test run block.
+//
+// The path is a single dotted segment (rather than one segment per path
+// component) so that the resulting configuration can be located within the
+// root configuration's children while the init graph resolves it, while still
+// producing a stable, unique module manifest key.
+//
+// Some examples:
+//   - file: main.tftest.hcl, run: setup - test.main.setup
+//   - file: tests/main.tftest.hcl, run: setup - test.tests.main.setup
+func TestRunModulePath(fileName, runName string) addrs.Module {
+	dir := path.Dir(fileName)
+	base := path.Base(fileName)
+
+	parts := []string{"test"}
+	if dir != "." {
+		parts = append(parts, strings.Split(dir, "/")...)
+	}
+	parts = append(parts, strings.TrimSuffix(base, ".tftest.hcl"), runName)
+
+	return addrs.Module{strings.Join(parts, ".")}
+}
+
 func buildTestModules(root *Config, walker ModuleWalker) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
@@ -106,35 +130,36 @@ func buildTestModules(root *Config, walker ModuleWalker) hcl.Diagnostics {
 				continue
 			}
 
-			// We want to make sure the path for the testing modules are unique
-			// so we create a dedicated path for them.
-			//
-			// Some examples:
-			//    - file: main.tftest.hcl, run: setup - test.main.setup
-			//    - file: tests/main.tftest.hcl, run: setup - test.tests.main.setup
+			modPath := TestRunModulePath(name, run.Name)
+			key := modPath[len(modPath)-1]
 
-			dir := path.Dir(name)
-			base := path.Base(name)
+			cfg, alreadyBuilt := root.Children[key]
+			if alreadyBuilt {
+				// The init graph already installed this run's module and
+				// resolved its descendant modules (including any using dynamic
+				// source addresses), attaching the result as a child of the
+				// root configuration. We adopt it here and detach it, since it
+				// is not really a child of the root module.
+				delete(root.Children, key)
+			} else {
+				// Fall back to loading the module statically. This path is used
+				// by callers that don't build the configuration through the
+				// init graph, and therefore cannot resolve dynamic source
+				// addresses within the test module.
+				req := ModuleRequest{
+					Name:              run.Name,
+					Path:              modPath,
+					SourceAddr:        run.Module.Source,
+					SourceAddrRange:   run.Module.SourceDeclRange,
+					VersionConstraint: run.Module.Version,
+					Parent:            root,
+					CallRange:         run.Module.DeclRange,
+				}
 
-			path := addrs.Module{}
-			path = append(path, "test")
-			if dir != "." {
-				path = append(path, strings.Split(dir, "/")...)
+				var modDiags hcl.Diagnostics
+				cfg, modDiags = loadModule(root, &req, walker)
+				diags = append(diags, modDiags...)
 			}
-			path = append(path, strings.TrimSuffix(base, ".tftest.hcl"), run.Name)
-
-			req := ModuleRequest{
-				Name:              run.Name,
-				Path:              path,
-				SourceAddr:        run.Module.Source,
-				SourceAddrRange:   run.Module.SourceDeclRange,
-				VersionConstraint: run.Module.Version,
-				Parent:            root,
-				CallRange:         run.Module.DeclRange,
-			}
-
-			cfg, modDiags := loadModule(root, &req, walker)
-			diags = append(diags, modDiags...)
 
 			if cfg != nil {
 				// To get the loader to work, we need to set a bunch of values

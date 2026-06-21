@@ -54,6 +54,14 @@ func (b *InitGraphBuilder) Steps() []GraphTransformer {
 			Walker: b.Walker,
 		},
 
+		// Install the alternative modules referenced by test run blocks so
+		// that their descendant modules (including any with dynamic source
+		// addresses) are resolved through the init graph as well.
+		&TestModuleTransformer{
+			Config: b.Config,
+			Walker: b.Walker,
+		},
+
 		&LocalTransformer{
 			Config: b.Config,
 		},
