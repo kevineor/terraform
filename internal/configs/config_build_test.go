@@ -536,3 +536,58 @@ func TestBuildConfig_WithTestModule(t *testing.T) {
 		t.Errorf("config under test path should be the root module")
 	}
 }
+
+func TestTestRunModulePath(t *testing.T) {
+	tests := []struct {
+		fileName string
+		runName  string
+		want     string
+	}{
+		{
+			fileName: "main.tftest.hcl",
+			runName:  "setup",
+			want:     "test.main.setup",
+		},
+		{
+			fileName: "tests/main.tftest.hcl",
+			runName:  "setup",
+			want:     "test.tests.main.setup",
+		},
+		{
+			fileName: "tests/integration/main.tftest.hcl",
+			runName:  "setup",
+			want:     "test.tests.integration.main.setup",
+		},
+		{
+			fileName: "main.tftest.hcl",
+			runName:  "my_run",
+			want:     "test.main.my_run",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.fileName+"/"+tc.runName, func(t *testing.T) {
+			got := TestRunModulePath(tc.fileName, tc.runName)
+			if len(got) != 1 {
+				t.Fatalf("expected single-segment path, got %d segments: %v", len(got), got)
+			}
+			if got[0] != tc.want {
+				t.Errorf("got %q, want %q", got[0], tc.want)
+			}
+		})
+	}
+}
+
+func TestTestRunModulePathIsNotValidIdentifier(t *testing.T) {
+	// The synthetic key must not be a valid HCL identifier, since that
+	// property is used elsewhere to distinguish test run modules from
+	// regular module calls in shared maps (Children, ModuleCalls).
+	path := TestRunModulePath("main.tftest.hcl", "setup")
+	key := path[0]
+	for _, ch := range key {
+		if ch == '.' {
+			return // contains a dot -> not a valid identifier
+		}
+	}
+	t.Errorf("TestRunModulePath key %q does not contain a dot and may be a valid identifier", key)
+}

@@ -105,9 +105,19 @@ func installMockDataFiles(root *Config, loader MockDataLoader) hcl.Diagnostics {
 // root configuration's children while the init graph resolves it, while still
 // producing a stable, unique module manifest key.
 //
+// The resulting key is intentionally not a valid HCL identifier (it contains
+// dots), which distinguishes it from regular module call names everywhere the
+// two share a map (e.g. Module.ModuleCalls, Config.Children).
+//
+// Uniqueness relies on the convention that test file names use ".tftest.hcl"
+// as their extension and that run names are valid identifiers. Two runs with
+// the same name in files that differ only by path separator vs dot would
+// collide, but that cannot happen in practice because dots are not valid in
+// directory names on any supported platform.
+//
 // Some examples:
-//   - file: main.tftest.hcl, run: setup - test.main.setup
-//   - file: tests/main.tftest.hcl, run: setup - test.tests.main.setup
+//   - file: main.tftest.hcl, run: setup -> test.main.setup
+//   - file: tests/main.tftest.hcl, run: setup -> test.tests.main.setup
 func TestRunModulePath(fileName, runName string) addrs.Module {
 	dir := path.Dir(fileName)
 	base := path.Base(fileName)
@@ -140,7 +150,12 @@ func buildTestModules(root *Config, walker ModuleWalker) hcl.Diagnostics {
 				// source addresses), attaching the result as a child of the
 				// root configuration. We adopt it here and detach it, since it
 				// is not really a child of the root module.
+				//
+				// Also remove the synthetic ModuleCall that TestModuleTransformer
+				// registered under the same key: it was only needed during the
+				// init walk and should not be visible to later passes.
 				delete(root.Children, key)
+				delete(root.Module.ModuleCalls, key)
 			} else {
 				// Fall back to loading the module statically. This path is used
 				// by callers that don't build the configuration through the

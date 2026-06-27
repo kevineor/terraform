@@ -70,7 +70,10 @@ func (t *TestModuleTransformer) Transform(g *Graph) error {
 			//
 			// The config body carries the variable expressions from the run
 			// block so that ModuleVariableTransformer can resolve them during
-			// the init walk without any special-case handling.
+			// the init walk without any special-case handling. It also makes
+			// nodeInstallModule.References() aware of those expressions, so
+			// that any locals or variables they reference create proper
+			// dependency edges in the init graph.
 			call := &configs.ModuleCall{
 				Name:       run.Name,
 				SourceExpr: hcl.StaticExpr(cty.StringVal(run.Module.Source.String()), run.Module.SourceDeclRange),

@@ -2710,6 +2710,111 @@ func TestTest_DynamicSourceInTestModuleConstVar(t *testing.T) {
 	}
 }
 
+func TestTest_DynamicSourceInTestModuleMissingVar(t *testing.T) {
+	// A test run module with a required variable that is not supplied via
+	// run.Variables should fail during terraform init with a clear diagnostic,
+	// not silently produce unknown values or panic.
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_in_test_module_missing_var")), td)
+	t.Chdir(td)
+
+	providerSource := newMockProviderSource(t, map[string][]string{
+		"test": {"1.0.0"},
+	})
+
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		testingOverrides: &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"): func() (providers.Interface, error) {
+					return testing_command.NewProvider(&testing_command.ResourceStore{
+						Data: make(map[string]cty.Value),
+					}).Provider, nil
+				},
+			},
+		},
+		Ui:             ui,
+		View:           view,
+		Streams:        streams,
+		ProviderSource: providerSource,
+	}
+
+	init := &InitCommand{Meta: meta}
+	code := init.Run(nil)
+	output := done(t)
+
+	if code == 0 {
+		t.Fatalf("expected init to fail due to missing required variable, but it succeeded:\n\n%s", output.All())
+	}
+
+	if !strings.Contains(output.All(), "required") {
+		t.Errorf("expected output to mention a required argument, got:\n\n%s", output.All())
+	}
+}
+
+func TestTest_DynamicSourceInTestModuleVarOverride(t *testing.T) {
+	// A run.Variables expression should override the const variable default,
+	// causing the init graph to resolve a different dynamic source than the
+	// default would produce.
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_in_test_module_var_override")), td)
+	t.Chdir(td)
+
+	store := &testing_command.ResourceStore{
+		Data: make(map[string]cty.Value),
+	}
+	providerSource := newMockProviderSource(t, map[string][]string{
+		"test": {"1.0.0"},
+	})
+
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		testingOverrides: &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"): func() (providers.Interface, error) {
+					return testing_command.NewProvider(store).Provider, nil
+				},
+			},
+		},
+		Ui:             ui,
+		View:           view,
+		Streams:        streams,
+		ProviderSource: providerSource,
+	}
+
+	init := &InitCommand{Meta: meta}
+	if code := init.Run(nil); code != 0 {
+		output := done(t)
+		t.Fatalf("expected status code 0 but got %d: %s", code, output.All())
+	}
+
+	streams, done = terminal.StreamsForTesting(t)
+	meta.Streams = streams
+	meta.View = views.NewView(streams)
+
+	c := &TestCommand{Meta: meta}
+	code := c.Run([]string{"-no-color"})
+	output := done(t)
+
+	if code != 0 {
+		t.Errorf("expected status code 0 but got %d:\n\n%s", code, output.All())
+	}
+
+	if !strings.Contains(output.Stdout(), "1 passed, 0 failed.") {
+		t.Errorf("output didn't contain expected string:\n\n%s", output.Stdout())
+	}
+
+	if len(store.Data) != 0 {
+		t.Errorf("should have deleted all resources on completion but left %d", len(store.Data))
+	}
+}
+
 func TestTest_DynamicSourceNested(t *testing.T) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_nested")), td)
