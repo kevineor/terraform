@@ -4,6 +4,7 @@
 package terraform
 
 import (
+	"fmt"
 	"log"
 
 	"github.com/hashicorp/hcl/v2"
@@ -26,6 +27,11 @@ import (
 // a synthetic single-segment key (see configs.TestRunModulePath). The configs
 // package later detaches it from the root and records it as the run block's
 // configuration under test.
+//
+// A synthetic ModuleCall is also registered in the root module's ModuleCalls
+// map under the same key, carrying the variable expressions from the run
+// block. This lets ModuleVariableTransformer find a call site for the module
+// without any special-case handling.
 type TestModuleTransformer struct {
 	Config *configs.Config
 	Walker configs.ModuleWalker
@@ -61,15 +67,26 @@ func (t *TestModuleTransformer) Transform(g *Graph) error {
 			// The source (and version) of a test run "module" block is always
 			// a static literal, so we can rebuild equivalent expressions from
 			// the already-parsed values rather than retaining the originals.
+			//
+			// The config body carries the variable expressions from the run
+			// block so that ModuleVariableTransformer can resolve them during
+			// the init walk without any special-case handling.
 			call := &configs.ModuleCall{
 				Name:       run.Name,
 				SourceExpr: hcl.StaticExpr(cty.StringVal(run.Module.Source.String()), run.Module.SourceDeclRange),
-				Config:     hcl.EmptyBody(),
+				Config:     runVariableBody{exprs: run.Variables, rng: run.Module.DeclRange},
 				DeclRange:  run.Module.DeclRange,
 			}
 			if len(run.Module.Version.Required) > 0 {
 				call.VersionExpr = hcl.StaticExpr(cty.StringVal(run.Module.Version.Required.String()), run.Module.Version.DeclRange)
 			}
+
+			// Register the call in the root module so that
+			// ModuleVariableTransformer can find a call site for this module
+			// during the init sub-graph walk (DynamicExpand). The entry is
+			// keyed by the synthetic path segment, not by run.Name, to match
+			// what c.Path.Call() returns inside transformSingle.
+			t.Config.Module.ModuleCalls[key] = call
 
 			n := &nodeInstallModule{
 				Addr:       instancePath,
@@ -83,4 +100,83 @@ func (t *TestModuleTransformer) Transform(g *Graph) error {
 	}
 
 	return nil
+}
+
+// runVariableBody is an hcl.Body backed by the variable expressions from a
+// test run block. It is used as the Config body of the synthetic ModuleCall
+// registered for each test run module, so that ModuleVariableTransformer can
+// read per-variable expressions the same way it does for regular module calls.
+type runVariableBody struct {
+	exprs map[string]hcl.Expression
+	rng   hcl.Range
+}
+
+func (b runVariableBody) Content(schema *hcl.BodySchema) (*hcl.BodyContent, hcl.Diagnostics) {
+	content, remain, diags := b.PartialContent(schema)
+	remainB := remain.(runVariableBody)
+	for name := range remainB.exprs {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Unsupported argument",
+			Detail:   fmt.Sprintf("An argument named %q is not expected here.", name),
+			Subject:  b.exprs[name].StartRange().Ptr(),
+		})
+	}
+	return content, diags
+}
+
+func (b runVariableBody) PartialContent(schema *hcl.BodySchema) (*hcl.BodyContent, hcl.Body, hcl.Diagnostics) {
+	var diags hcl.Diagnostics
+	content := &hcl.BodyContent{
+		Attributes:       make(hcl.Attributes),
+		MissingItemRange: b.rng,
+	}
+
+	remain := make(map[string]hcl.Expression, len(b.exprs))
+	for k, v := range b.exprs {
+		remain[k] = v
+	}
+
+	for _, attrS := range schema.Attributes {
+		delete(remain, attrS.Name)
+		expr, defined := b.exprs[attrS.Name]
+		if !defined {
+			if attrS.Required {
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Missing required argument",
+					Detail:   fmt.Sprintf("The argument %q is required, but no definition was found.", attrS.Name),
+					Subject:  b.rng.Ptr(),
+				})
+			}
+			continue
+		}
+		rng := expr.StartRange()
+		content.Attributes[attrS.Name] = &hcl.Attribute{
+			Name:      attrS.Name,
+			Expr:      expr,
+			NameRange: rng,
+			Range:     rng,
+		}
+	}
+
+	return content, runVariableBody{exprs: remain, rng: b.rng}, diags
+}
+
+func (b runVariableBody) JustAttributes() (hcl.Attributes, hcl.Diagnostics) {
+	ret := make(hcl.Attributes, len(b.exprs))
+	for name, expr := range b.exprs {
+		rng := expr.StartRange()
+		ret[name] = &hcl.Attribute{
+			Name:      name,
+			Expr:      expr,
+			NameRange: rng,
+			Range:     rng,
+		}
+	}
+	return ret, nil
+}
+
+func (b runVariableBody) MissingItemRange() hcl.Range {
+	return b.rng
 }
