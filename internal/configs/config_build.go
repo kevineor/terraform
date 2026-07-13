@@ -97,6 +97,29 @@ func installMockDataFiles(root *Config, loader MockDataLoader) hcl.Diagnostics {
 	return diags
 }
 
+// TestRunModulePath returns the synthetic single-segment path used to identify
+// a test run's alternative module in the config tree.
+//
+// The key is a dot-joined string (e.g. "test.main.setup") that encodes the
+// test file name and run name. It is single-segment so that, when installed
+// through the init graph, the module sits directly beneath the root module.
+//
+// Some examples:
+//   - file: main.tftest.hcl, run: setup  →  "test.main.setup"
+//   - file: tests/main.tftest.hcl, run: setup  →  "test.tests.main.setup"
+func TestRunModulePath(fileName, runName string) addrs.Module {
+	dir := path.Dir(fileName)
+	base := path.Base(fileName)
+
+	parts := []string{"test"}
+	if dir != "." {
+		parts = append(parts, strings.Split(dir, "/")...)
+	}
+	parts = append(parts, strings.TrimSuffix(base, ".tftest.hcl"), runName)
+
+	return addrs.Module{strings.Join(parts, ".")}
+}
+
 func buildTestModules(root *Config, walker ModuleWalker) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
@@ -106,56 +129,47 @@ func buildTestModules(root *Config, walker ModuleWalker) hcl.Diagnostics {
 				continue
 			}
 
-			// We want to make sure the path for the testing modules are unique
-			// so we create a dedicated path for them.
-			//
-			// Some examples:
-			//    - file: main.tftest.hcl, run: setup - test.main.setup
-			//    - file: tests/main.tftest.hcl, run: setup - test.tests.main.setup
+			modPath := TestRunModulePath(name, run.Name)
+			key := modPath[len(modPath)-1]
 
-			dir := path.Dir(name)
-			base := path.Base(name)
+			// When the configuration is built through the init graph,
+			// nodeInstallTestRunModule has already installed this run's module
+			// (resolving any dynamic source addresses in its descendants) and
+			// attached it under the root module as a walk-time scaffold. Detach
+			// it here. Otherwise (callers that build statically via BuildConfig)
+			// we load it now, just like buildChildModules does for regular
+			// module calls; dynamic source addresses cannot be resolved on that
+			// static path.
+			cfg, installed := root.Children[key]
+			if installed {
+				delete(root.Children, key)
+			} else {
+				req := ModuleRequest{
+					Name:              run.Name,
+					Path:              modPath,
+					SourceAddr:        run.Module.Source,
+					SourceAddrRange:   run.Module.SourceDeclRange,
+					VersionConstraint: run.Module.Version,
+					Parent:            root,
+					CallRange:         run.Module.DeclRange,
+				}
 
-			path := addrs.Module{}
-			path = append(path, "test")
-			if dir != "." {
-				path = append(path, strings.Split(dir, "/")...)
+				var modDiags hcl.Diagnostics
+				cfg, modDiags = loadModule(root, &req, walker)
+				diags = append(diags, modDiags...)
 			}
-			path = append(path, strings.TrimSuffix(base, ".tftest.hcl"), run.Name)
-
-			req := ModuleRequest{
-				Name:              run.Name,
-				Path:              path,
-				SourceAddr:        run.Module.Source,
-				SourceAddrRange:   run.Module.SourceDeclRange,
-				VersionConstraint: run.Module.Version,
-				Parent:            root,
-				CallRange:         run.Module.DeclRange,
-			}
-
-			cfg, modDiags := loadModule(root, &req, walker)
-			diags = append(diags, modDiags...)
 
 			if cfg != nil {
-				// To get the loader to work, we need to set a bunch of values
-				// (like the name, path, and parent) as if the module was being
-				// loaded as a child of the root config.
-				//
-				// In actuality, when this is executed it will be as if the
-				// module was the root. So, we'll post-process some things to
-				// get it to behave as expected later.
-
-				// First, update the main module for this test run to behave as
-				// if it is the root module.
+				// The module was loaded as if it were a child of the root
+				// config (so we could reuse the regular module loader), but at
+				// execution time it acts as the root module. Detach it from its
+				// parent and rebase the paths of it and all its children so they
+				// are relative to it.
 				cfg.Parent = nil
-
-				// Then we need to update the paths for this config and all
-				// children, so they think they are all relative to the root
-				// module we just created.
 				rebaseChildModule(cfg, cfg)
 
-				// Finally, link the new config back into our test run so
-				// it can be retrieved later.
+				// Link the config back into the test run so it can be retrieved
+				// later.
 				run.ConfigUnderTest = cfg
 			}
 		}
