@@ -577,17 +577,3 @@ func TestTestRunModulePath(t *testing.T) {
 		})
 	}
 }
-
-func TestTestRunModulePathIsNotValidIdentifier(t *testing.T) {
-	// The synthetic key must not be a valid HCL identifier, since that
-	// property is used elsewhere to distinguish test run modules from
-	// regular module calls in shared maps (Children, ModuleCalls).
-	path := TestRunModulePath("main.tftest.hcl", "setup")
-	key := path[0]
-	for _, ch := range key {
-		if ch == '.' {
-			return // contains a dot -> not a valid identifier
-		}
-	}
-	t.Errorf("TestRunModulePath key %q does not contain a dot and may be a valid identifier", key)
-}

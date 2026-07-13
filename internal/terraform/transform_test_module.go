@@ -4,34 +4,30 @@
 package terraform
 
 import (
-	"fmt"
 	"log"
 
 	"github.com/hashicorp/hcl/v2"
-	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
+	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
-// TestModuleTransformer adds install nodes for the alternative modules
-// referenced by "module" blocks inside test run blocks.
+// TestModuleTransformer adds an install node for each "module" block declared
+// in a test run block.
 //
-// Those modules act as the configuration under test for their run block, so
-// they (and their descendant modules) must be installed and resolved just like
-// the root module. Routing them through the init graph, rather than loading
-// them statically, is what lets their descendant modules use dynamic
+// Those alternative modules act as the configuration under test for their run
+// block, so they (and their descendant modules) must be installed and resolved
+// just like the root module. Routing them through the init graph, rather than
+// loading them statically, is what lets their descendant modules use dynamic
 // (expression-based) source addresses.
 //
-// Each installed module is attached as a child of the root configuration under
-// a synthetic single-segment key (see configs.TestRunModulePath). The configs
-// package later detaches it from the root and records it as the run block's
-// configuration under test.
-//
-// A synthetic ModuleCall is also registered in the root module's ModuleCalls
-// map under the same key, carrying the variable expressions from the run
-// block. This lets ModuleVariableTransformer find a call site for the module
-// without any special-case handling.
+// The node represents the run as a whole: the run block carries both the
+// module source and the input variable expressions, which is everything needed
+// to install the module and walk its descendants. Once installed, the node
+// records the result on the run's ConfigUnderTest; configs.FinalizeConfig later
+// rebases it to act as the root of its own module tree.
 type TestModuleTransformer struct {
 	Config *configs.Config
 	Walker configs.ModuleWalker
@@ -59,43 +55,22 @@ func (t *TestModuleTransformer) Transform(g *Graph) error {
 			key := modPath[len(modPath)-1]
 			instancePath := g.Path.Child(key, addrs.NoKey)
 
-			// Synthesize a module call so we can reuse nodeInstallModule. The
-			// call's name is the run name (a valid identifier used for
-			// diagnostics and the module manifest), while the synthetic key
-			// distinguishes this run's module within the root configuration.
-			//
-			// The source (and version) of a test run "module" block is always
-			// a static literal, so we can rebuild equivalent expressions from
-			// the already-parsed values rather than retaining the originals.
-			//
-			// The config body carries the variable expressions from the run
-			// block so that ModuleVariableTransformer can resolve them during
-			// the init walk without any special-case handling. It also makes
-			// nodeInstallModule.References() aware of those expressions, so
-			// that any locals or variables they reference create proper
-			// dependency edges in the init graph.
-			call := &configs.ModuleCall{
-				Name:       run.Name,
-				SourceExpr: hcl.StaticExpr(cty.StringVal(run.Module.Source.String()), run.Module.SourceDeclRange),
-				Config:     runVariableBody{exprs: run.Variables, rng: run.Module.DeclRange},
-				DeclRange:  run.Module.DeclRange,
+			// A run module receives the test file's global variables as well as
+			// the run block's own, with the run block taking precedence.
+			variables := make(map[string]hcl.Expression, len(file.Variables)+len(run.Variables))
+			for k, v := range file.Variables {
+				variables[k] = v
 			}
-			if len(run.Module.Version.Required) > 0 {
-				call.VersionExpr = hcl.StaticExpr(cty.StringVal(run.Module.Version.Required.String()), run.Module.Version.DeclRange)
+			for k, v := range run.Variables {
+				variables[k] = v
 			}
 
-			// Register the call in the root module so that
-			// ModuleVariableTransformer can find a call site for this module
-			// during the init sub-graph walk (DynamicExpand). The entry is
-			// keyed by the synthetic path segment, not by run.Name, to match
-			// what c.Path.Call() returns inside transformSingle.
-			t.Config.Module.ModuleCalls[key] = call
-
-			n := &nodeInstallModule{
-				Addr:       instancePath,
-				ModuleCall: call,
-				Parent:     t.Config,
-				Walker:     t.Walker,
+			n := &nodeInstallTestRunModule{
+				Addr:      instancePath,
+				Run:       run,
+				Variables: variables,
+				Parent:    t.Config,
+				Walker:    t.Walker,
 			}
 			g.Add(n)
 			log.Printf("[TRACE] TestModuleTransformer: Added %s for run %q in %s", instancePath, run.Name, name)
@@ -105,81 +80,147 @@ func (t *TestModuleTransformer) Transform(g *Graph) error {
 	return nil
 }
 
-// runVariableBody is an hcl.Body backed by the variable expressions from a
-// test run block. It is used as the Config body of the synthetic ModuleCall
-// registered for each test run module, so that ModuleVariableTransformer can
-// read per-variable expressions the same way it does for regular module calls.
-type runVariableBody struct {
-	exprs map[string]hcl.Expression
-	rng   hcl.Range
+// nodeInstallTestRunModule installs the alternative module of a single test run
+// block and resolves its descendant modules through the init graph.
+//
+// It mirrors nodeInstallModule, but its "call site" is a run block rather than
+// a module call: the source is already a parsed literal (run.Module.Source) and
+// the input arguments come from the run block's (and test file's) variables.
+type nodeInstallTestRunModule struct {
+	// Addr is the synthetic single-segment module instance the run module is
+	// installed under (e.g. test.main.setup), placing it directly beneath the
+	// root module in the graph.
+	Addr addrs.ModuleInstance
+	Run  *configs.TestRun
+
+	// Variables holds the input variable expressions supplied to the run
+	// module: the test file's global variables merged with the run block's own.
+	Variables map[string]hcl.Expression
+
+	Parent *configs.Config
+	Walker configs.ModuleWalker
+
+	// Config stores the configuration of the installed module.
+	Config *configs.Config
 }
 
-func (b runVariableBody) Content(schema *hcl.BodySchema) (*hcl.BodyContent, hcl.Diagnostics) {
-	content, remain, diags := b.PartialContent(schema)
-	remainB := remain.(runVariableBody)
-	for name := range remainB.exprs {
-		diags = append(diags, &hcl.Diagnostic{
-			Severity: hcl.DiagError,
-			Summary:  "Unsupported argument",
-			Detail:   fmt.Sprintf("An argument named %q is not expected here.", name),
-			Subject:  b.exprs[name].StartRange().Ptr(),
-		})
-	}
-	return content, diags
+var (
+	_ GraphNodeExecutable        = (*nodeInstallTestRunModule)(nil)
+	_ GraphNodeReferencer        = (*nodeInstallTestRunModule)(nil)
+	_ GraphNodeDynamicExpandable = (*nodeInstallTestRunModule)(nil)
+	_ GraphNodeModuleInstance    = (*nodeInstallTestRunModule)(nil)
+)
+
+func (n *nodeInstallTestRunModule) Path() addrs.ModuleInstance {
+	return n.Addr.Parent()
 }
 
-func (b runVariableBody) PartialContent(schema *hcl.BodySchema) (*hcl.BodyContent, hcl.Body, hcl.Diagnostics) {
-	var diags hcl.Diagnostics
-	content := &hcl.BodyContent{
-		Attributes:       make(hcl.Attributes),
-		MissingItemRange: b.rng,
-	}
-
-	remain := make(map[string]hcl.Expression, len(b.exprs))
-	for k, v := range b.exprs {
-		remain[k] = v
-	}
-
-	for _, attrS := range schema.Attributes {
-		delete(remain, attrS.Name)
-		expr, defined := b.exprs[attrS.Name]
-		if !defined {
-			if attrS.Required {
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Missing required argument",
-					Detail:   fmt.Sprintf("The argument %q is required, but no definition was found.", attrS.Name),
-					Subject:  b.rng.Ptr(),
-				})
-			}
-			continue
-		}
-		rng := expr.StartRange()
-		content.Attributes[attrS.Name] = &hcl.Attribute{
-			Name:      attrS.Name,
-			Expr:      expr,
-			NameRange: rng,
-			Range:     rng,
-		}
-	}
-
-	return content, runVariableBody{exprs: remain, rng: b.rng}, diags
+func (n *nodeInstallTestRunModule) Name() string {
+	return n.Addr.String()
 }
 
-func (b runVariableBody) JustAttributes() (hcl.Attributes, hcl.Diagnostics) {
-	ret := make(hcl.Attributes, len(b.exprs))
-	for name, expr := range b.exprs {
-		rng := expr.StartRange()
-		ret[name] = &hcl.Attribute{
-			Name:      name,
-			Expr:      expr,
-			NameRange: rng,
-			Range:     rng,
-		}
-	}
-	return ret, nil
+func (n *nodeInstallTestRunModule) ModulePath() addrs.Module {
+	return n.Addr.Module().Parent()
 }
 
-func (b runVariableBody) MissingItemRange() hcl.Range {
-	return b.rng
+func (n *nodeInstallTestRunModule) References() []*addrs.Reference {
+	var refs []*addrs.Reference
+
+	// The source and version of a run "module" block are always static
+	// literals, so the only references we can contribute come from the input
+	// variable expressions. Some of those may be used as constant variables to
+	// build a descendant module's source, so wiring them creates the proper
+	// dependency edges in the init graph.
+	for _, expr := range n.Variables {
+		inputRefs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, expr)
+		refs = append(refs, inputRefs...)
+	}
+
+	return refs
+}
+
+func (n *nodeInstallTestRunModule) Execute(ctx EvalContext, walkOp walkOperation) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	req := &configs.ModuleRequest{
+		Name:              n.Run.Name,
+		Path:              n.Addr.Module(),
+		SourceAddr:        n.Run.Module.Source,
+		SourceAddrRange:   n.Run.Module.SourceDeclRange,
+		VersionConstraint: n.Run.Module.Version,
+		Parent:            n.Parent,
+		CallRange:         n.Run.Module.DeclRange,
+	}
+
+	cfg, ver, modDiags := n.Walker.LoadModule(req)
+	diags = diags.Append(modDiags)
+	if diags.HasErrors() {
+		return diags
+	}
+
+	config := &configs.Config{
+		Module:            cfg,
+		Parent:            n.Parent,
+		Path:              n.Addr.Module(),
+		Root:              n.Parent.Root,
+		Children:          map[string]*configs.Config{},
+		CallRange:         n.Run.Module.DeclRange,
+		SourceAddr:        n.Run.Module.Source,
+		SourceAddrRaw:     n.Run.Module.Source.String(),
+		SourceAddrRange:   n.Run.Module.SourceDeclRange,
+		Version:           ver,
+		VersionConstraint: n.Run.Module.Version,
+	}
+
+	// Attach the installed module under the root module, keyed by the synthetic
+	// path segment. This is a walk-time scaffold: while descendant modules are
+	// installed (in DynamicExpand), the evaluator resolves references within
+	// this module by looking it up from the root config via DescendantForInstance,
+	// so it must be reachable there. configs.FinalizeConfig (buildTestModules)
+	// later detaches it and records it as the run's ConfigUnderTest.
+	currentModuleKey := n.Addr[len(n.Addr)-1].Name
+	n.Parent.Children[currentModuleKey] = config
+
+	// During init, modules are loaded incrementally so the checks state built
+	// at walk start only knows about the root module. Register all checkable
+	// objects from the newly loaded module so that validation nodes added by
+	// DynamicExpand can find their check entries.
+	ctx.Checks().RegisterModule(config)
+
+	n.Config = config
+
+	return diags
+}
+
+func (n *nodeInstallTestRunModule) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.Diagnostics) {
+	var g Graph
+	var diags tfdiags.Diagnostics
+
+	if n.Config == nil {
+		// Cannot expand without a config. This can happen when something goes
+		// wrong during module installation/Execute() above.
+		return nil, diags
+	}
+
+	expander := ctx.InstanceExpander()
+	_, call := n.Addr.Call()
+	expander.SetModuleSingle(n.Path(), call)
+
+	graph, graphDiags := (&InitGraphBuilder{
+		Config: n.Config,
+		Walker: n.Walker,
+		// The run module's call site is the run block, so its input variable
+		// values come from the run/file variables rather than from a module
+		// call block.
+		CallExpressions: n.Variables,
+	}).Build(n.Addr)
+	diags = diags.Append(graphDiags)
+	if graphDiags.HasErrors() {
+		return nil, diags
+	}
+	g.Subsume(&graph.AcyclicGraph.Graph)
+
+	addRootNodeToGraph(&g)
+
+	return &g, nil
 }

@@ -33,6 +33,15 @@ type ModuleVariableTransformer struct {
 	// variables in the current module, skipping any child modules.
 	ModuleOnly bool
 
+	// CallExpressions, if set, provides the call-site argument expression for
+	// each of Config's input variables (keyed by variable name) instead of
+	// looking them up from a module call block in the parent module. It is only
+	// honored in ModuleOnly mode and is used for test run modules, whose call
+	// site is a run block rather than a module call. Unlike a module call
+	// block, these expressions are not schema-validated: variables absent from
+	// the map fall back to their default, and extra entries are ignored.
+	CallExpressions map[string]hcl.Expression
+
 	// ValidateChecks should be set to true if the graph should run the user-defined validations for child module variables
 	ValidateChecks bool
 
@@ -77,43 +86,51 @@ func (t *ModuleVariableTransformer) transform(g *Graph, parent, c *configs.Confi
 }
 
 func (t *ModuleVariableTransformer) transformSingle(g *Graph, parent, c *configs.Config) error {
-	_, call := c.Path.Call()
-
-	// Find the call in the parent module configuration, so we can get the
-	// expressions given for each input variable at the call site.
-	callConfig, exists := parent.Module.ModuleCalls[call.Name]
-	if !exists {
-		// This should never happen, since it indicates an improperly-constructed
-		// configuration tree.
-		panic(fmt.Errorf("no module call block found for %s", c.Path))
-	}
-
-	// We need to construct a schema for the expected call arguments based on
-	// the configured variables in our config, which we can then use to
-	// decode the content of the call block.
-	schema := &hcl.BodySchema{}
-	for _, v := range c.Module.Variables {
-		schema.Attributes = append(schema.Attributes, hcl.AttributeSchema{
-			Name:     v.Name,
-			Required: v.Default == cty.NilVal,
-		})
-	}
-
-	content, contentDiags := callConfig.Config.Content(schema)
-	if contentDiags.HasErrors() {
-		// Validation code elsewhere should deal with any errors before we
-		// get in here, but we'll report them out here just in case, to
-		// avoid crashes.
-		var diags tfdiags.Diagnostics
-		diags = diags.Append(contentDiags)
-		return diags.Err()
-	}
-
-	for _, v := range c.Module.Variables {
-		var expr hcl.Expression
-		if attr := content.Attributes[v.Name]; attr != nil {
-			expr = attr.Expr
+	// Determine the call-site expression for each of c's input variables.
+	// Normally these come from the module call block in the parent module, but
+	// a caller may supply them directly via CallExpressions (e.g. for test run
+	// modules, whose call site is a run block rather than a module call).
+	exprs := t.CallExpressions
+	if exprs == nil {
+		_, call := c.Path.Call()
+		callConfig, exists := parent.Module.ModuleCalls[call.Name]
+		if !exists {
+			// This should never happen, since it indicates an improperly-constructed
+			// configuration tree.
+			panic(fmt.Errorf("no module call block found for %s", c.Path))
 		}
+
+		// We need to construct a schema for the expected call arguments based
+		// on the configured variables in our config, which we can then use to
+		// decode the content of the call block.
+		schema := &hcl.BodySchema{}
+		for _, v := range c.Module.Variables {
+			schema.Attributes = append(schema.Attributes, hcl.AttributeSchema{
+				Name:     v.Name,
+				Required: v.Default == cty.NilVal,
+			})
+		}
+
+		content, contentDiags := callConfig.Config.Content(schema)
+		if contentDiags.HasErrors() {
+			// Validation code elsewhere should deal with any errors before we
+			// get in here, but we'll report them out here just in case, to
+			// avoid crashes.
+			var diags tfdiags.Diagnostics
+			diags = diags.Append(contentDiags)
+			return diags.Err()
+		}
+
+		exprs = make(map[string]hcl.Expression, len(content.Attributes))
+		for name, attr := range content.Attributes {
+			exprs[name] = attr.Expr
+		}
+	}
+
+	for _, v := range c.Module.Variables {
+		// A variable absent from exprs gets a nil expression, so it falls back
+		// to its declared default during evaluation.
+		expr := exprs[v.Name]
 
 		// Add a plannable node, as the variable may expand
 		// during module expansion

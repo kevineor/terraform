@@ -2710,51 +2710,6 @@ func TestTest_DynamicSourceInTestModuleConstVar(t *testing.T) {
 	}
 }
 
-func TestTest_DynamicSourceInTestModuleMissingVar(t *testing.T) {
-	// A test run module with a required variable that is not supplied via
-	// run.Variables should fail during terraform init with a clear diagnostic,
-	// not silently produce unknown values or panic.
-	td := t.TempDir()
-	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_in_test_module_missing_var")), td)
-	t.Chdir(td)
-
-	providerSource := newMockProviderSource(t, map[string][]string{
-		"test": {"1.0.0"},
-	})
-
-	streams, done := terminal.StreamsForTesting(t)
-	view := views.NewView(streams)
-	ui := new(cli.MockUi)
-
-	meta := Meta{
-		testingOverrides: &testingOverrides{
-			Providers: map[addrs.Provider]providers.Factory{
-				addrs.NewDefaultProvider("test"): func() (providers.Interface, error) {
-					return testing_command.NewProvider(&testing_command.ResourceStore{
-						Data: make(map[string]cty.Value),
-					}).Provider, nil
-				},
-			},
-		},
-		Ui:             ui,
-		View:           view,
-		Streams:        streams,
-		ProviderSource: providerSource,
-	}
-
-	init := &InitCommand{Meta: meta}
-	code := init.Run(nil)
-	output := done(t)
-
-	if code == 0 {
-		t.Fatalf("expected init to fail due to missing required variable, but it succeeded:\n\n%s", output.All())
-	}
-
-	if !strings.Contains(output.All(), "required") {
-		t.Errorf("expected output to mention a required argument, got:\n\n%s", output.All())
-	}
-}
-
 func TestTest_DynamicSourceInTestModuleVarOverride(t *testing.T) {
 	// A run.Variables expression should override the const variable default,
 	// causing the init graph to resolve a different dynamic source than the
